@@ -60,7 +60,7 @@ def create_parser():
   bullet-trade --version
   
   更多信息请访问: https://github.com/BulletTrade/bullet-trade
-               https://www.bullettrade.cn/
+               https://bullettrade.cn/
         """
     )
     

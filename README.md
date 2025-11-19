@@ -1,7 +1,7 @@
 # BulletTrade 
 
 <p>
-  <img src="docs/assets/bullet_trade_logo_transparent.svg" alt="BulletTrade Logo" width="100">
+  <img src="docs/assets/logo.png" alt="BulletTrade Logo" width="100">
 </p>
 
 [![PyPI version](https://badge.fury.io/py/bullet-trade.svg)](https://badge.fury.io/py/bullet-trade)
@@ -36,7 +36,7 @@
 ## 🔗 链接
 
 - GitHub 仓库：https://github.com/BulletTrade/bullet-trade
-- 官方站点：https://www.bullettrade.cn/
+- 官方站点：https://bullettrade.cn/
 
 
 ## 📄 许可证

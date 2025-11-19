@@ -10,11 +10,11 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
-    {name = "BulletTrade Team", email = "contact@bullettrade.dev"}
+    {name = "BulletTrade Team", email = "bullettrade.cn@gmail.com"}
 ]
 keywords = [
     "量化交易", "quantitative trading", "backtest", "聚宽",
-    "joinquant", "algotrading", "stock trading"
+    "joinquant", "algotrading", "stock trading", "live trading"
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -26,6 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Office/Business :: Financial :: Investment",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]

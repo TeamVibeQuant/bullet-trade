@@ -3,7 +3,7 @@
 BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多数据源、多券商接入，覆盖回测、仿真与本地/远程实盘。本页是文档主入口，与 bullettrade.cn 首页的“文档/帮助”按钮保持一致。
 
 <p>
-  <img src="assets/bullet_trade_logo_transparent.svg" alt="BulletTrade Logo" width="100">
+  <img src="assets/logo.png" alt="BulletTrade Logo" width="100">
 </p>
 
 ## index
@@ -17,7 +17,7 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
 
 **链接**：
 - GitHub 仓库 https://github.com/BulletTrade/bullet-trade 
-- 官方站点 https://www.bullettrade.cn/
+- 官方站点 https://bullettrade.cn/
 
 
 ## 一键安装与环境准备
