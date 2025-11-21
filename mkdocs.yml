@@ -12,6 +12,7 @@ nav:
   - 回测引擎: backtest.md
   - 实盘引擎: live.md
   - 交易支撑: trade-support.md
+  - QMT 服务配置: qmt-server.md
   - API 文档: api.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
@@ -19,7 +20,6 @@ nav:
       - MiniQMT 数据: data/DATA_PROVIDER_MINIQMT.md
       - Tushare 数据: data/DATA_PROVIDER_TUSHARE.md
   - 邀请贡献: contributing.md
-  - QMT 服务配置: qmt-server.md
 theme:
   name: material
   language: zh
