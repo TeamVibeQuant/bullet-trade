@@ -80,7 +80,7 @@ def create_parser():
     parser.add_argument(
         '--version',
         action='version',
-        version='%(prog)s 0.4.0'
+        version='%(prog)s 0.5.0'
     )
 
     # 全局 env 文件参数（对所有子命令生效）

@@ -262,6 +262,9 @@ bullet-trade optimize my_momentum.py \
     --output momentum_optimization.csv
 ```
 
+运行优化示例：
+![optimize-demo](assets/optimize-demo.png)
+
 ### 输出示例
 
 ```
