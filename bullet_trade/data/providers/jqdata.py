@@ -363,6 +363,17 @@ class JQDataProvider(DataProvider):
 
         return self._cache.cached_call('get_index_stocks', kwargs, _fetch, result_type='list_str')
 
+    def get_concept_stocks(self, concept_code: list = [], date: Optional[Union[str, datetime]] = None):
+        kwargs = {
+            'concept_code': concept_code,
+            'date': date,
+        }
+
+        def _fetch(kw: Dict[str, Any]) -> List[str]:
+            return jq.get_concept_stocks(kw.get('concept_code'), date=kw.get('date')) 
+
+        return self._cache.cached_call('get_concept_stocks', kwargs, _fetch, result_type='list_str')
+
     # ------------------------ Live 快照 ------------------------
     def get_live_current(self, security: str) -> Dict[str, Any]:
         """
