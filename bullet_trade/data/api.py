@@ -740,8 +740,9 @@ def get_price(
                 pre_factor_ref_date=pre_factor_ref_date
             )
             #log.debug(f"provider.get_price 返回: {type(result)}, {result.shape if hasattr(result, 'shape') else 'No shape'}")
-            df = _coerce_price_result_to_dataframe(result)
-            return _make_compatible_dataframe(df, fields)
+            return result
+            # df = _coerce_price_result_to_dataframe(result) # (tyb)TODO 这里会更改返回的数据类型，和平台上的对不齐，需要回退
+            # return _make_compatible_dataframe(df, fields)
             
         except Exception as e:
             log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
@@ -760,15 +761,28 @@ def get_price(
             panel=panel,
             fill_paused=fill_paused
         )
-        
+        return df
+
         # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
-        return _make_compatible_dataframe(df, fields)
+        # return _make_compatible_dataframe(df, fields)
         
     except Exception as e:
         log.error(f"获取价格数据失败: {e}")
         return pd.DataFrame()
 
+def get_concept_stocks(
+    concept_code: list = [],
+    date: Optional[Union[str, datetime]] = None
+) -> list:
+    # 确保数据提供者已认证
+    _ensure_auth()
 
+    return _provider.get_concept_stocks(
+            concept_code=concept_code,
+            date=date,
+    )
+    
+    # (tyb)TODO 可能需要考虑一些兼容性的问题，等碰到了再解决
 
 def _make_compatible_dataframe(df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
     """
