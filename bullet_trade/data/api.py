@@ -1137,14 +1137,26 @@ def get_price(
             return df
         
         # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
-        return _make_compatible_dataframe(df, fields)
+        # return _make_compatible_dataframe(df, fields)
         
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
         return pd.DataFrame()
 
+def get_concept_stocks(
+    concept_code: list = [],
+    date: Optional[Union[str, datetime]] = None
+) -> list:
+    # 确保数据提供者已认证
+    _ensure_auth()
 
+    return _provider.get_concept_stocks(
+            concept_code=concept_code,
+            date=date,
+    )
+    
+    # (tyb)TODO 可能需要考虑一些兼容性的问题，等碰到了再解决
 
 def _make_compatible_dataframe(df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
     """
