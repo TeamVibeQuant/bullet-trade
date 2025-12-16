@@ -2383,7 +2383,6 @@ def get_price(
     _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
     return final if final is not None else pd.DataFrame()
 
-
 def _make_compatible_dataframe(df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
     """
     让 DataFrame 兼容策略代码的访问方式

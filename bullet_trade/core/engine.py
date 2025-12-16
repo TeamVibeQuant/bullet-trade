@@ -406,6 +406,7 @@ class BacktestEngine:
         # 注入包装过的数据函数（支持真实价格和未来数据检测）
         module.get_price = wrapped_api.get_price
         module.history = wrapped_api.history
+        module.get_concept_stocks = wrapped_api.get_concept_stocks
         module.attribute_history = wrapped_api.attribute_history
         module.get_bars = wrapped_api.get_bars
         module.get_ticks = wrapped_api.get_ticks
@@ -470,6 +471,7 @@ class BacktestEngine:
         # 数据 API（包装层）
         jq_mod.get_price = wrapped_api.get_price
         jq_mod.history = wrapped_api.history
+        jq_mod.get_concept_stocks = wrapped_api.get_concept_stocks
         jq_mod.attribute_history = wrapped_api.attribute_history
         jq_mod.get_bars = wrapped_api.get_bars
         jq_mod.get_ticks = wrapped_api.get_ticks
@@ -857,7 +859,7 @@ class BacktestEngine:
 
             market_periods = get_market_periods()
 
-            # 执行当日调度（open/close等）
+            # 执行当日调度（open/close等） (tyb)TODO run之前需要更新持仓股票的价格到所在时刻的价格，否则用的是前一天的收盘价？
             self._run_trading_day(trade_day, market_periods)
 
             # 先更新收盘价与持仓市值，再记录每日数据，避免“日志总值≠CSV总值”的错位
