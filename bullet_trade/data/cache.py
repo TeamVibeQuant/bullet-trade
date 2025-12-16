@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional, Callable, List
 import pandas as pd
 import numpy as np
 
+import traceback
+from ..core.globals import log
 
 class CacheManager:
     """
@@ -288,9 +290,12 @@ class CacheManager:
             with open(tmp_meta_path, "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False)
             os.replace(tmp_meta_path, meta_path)
-        except Exception:
+        except Exception as e:
             # 忽略缓存写入失败
-            pass
+            log.info("缓存写入失败, method_name:{}, result_type:{}".format(method_name, result_type))
+            error_msg = traceback.format_exc()
+            print("捕获到异常：")
+            log.info(error_msg)
 
     @staticmethod
     def _safe_str(s: Any) -> str:
