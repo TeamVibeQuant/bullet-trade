@@ -1,1 +1,0 @@
-bullet-trade backtest vibe_team_strategy/base_2.py --start 2024-02-01 --end 2024-03-01
