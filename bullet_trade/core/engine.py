@@ -38,6 +38,7 @@ from ..data.api import (
     get_price as api_get_price,
     get_trade_days as api_get_trade_days,
     get_concept_stocks as api_get_concept_stocks,
+    get_factor_values as api_get_factor_values,
     get_data_provider,
     get_security_info,
 )
@@ -115,6 +116,7 @@ class BacktestEngine:
         self.trades = []  # 所有交易记录
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
+        self.benchmark = benchmark
         self.benchmark_data = None  # 基准数据
         # 新增：每日持仓快照记录
         self.daily_positions = []
@@ -288,6 +290,7 @@ class BacktestEngine:
         module.get_price = wrapped_api.get_price
         module.history = wrapped_api.history
         module.get_concept_stocks = wrapped_api.get_concept_stocks
+        module.get_factor_values = wrapped_api.get_factor_values
         module.attribute_history = wrapped_api.attribute_history
         module.get_bars = wrapped_api.get_bars
         module.get_ticks = wrapped_api.get_ticks
@@ -352,6 +355,7 @@ class BacktestEngine:
         jq_mod.get_price = wrapped_api.get_price
         jq_mod.history = wrapped_api.history
         jq_mod.get_concept_stocks = wrapped_api.get_concept_stocks
+        jq_mod.get_factor_values = wrapped_api.get_factor_values
         jq_mod.attribute_history = wrapped_api.attribute_history
         jq_mod.get_bars = wrapped_api.get_bars
         jq_mod.get_ticks = wrapped_api.get_ticks

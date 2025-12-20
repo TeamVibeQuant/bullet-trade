@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 from typing import Optional, Tuple, Any, Dict
 
 
@@ -213,11 +214,28 @@ def _clamp(value: float, lower: Optional[float], upper: Optional[float]) -> floa
     return value
 
 
-def _round_to_tick(price: float, tick_size: float) -> float:
+def _round_to_tick(price: float, tick_size: float, mode: str = "nearest") -> float:
+    """将价格对齐到最小价差。
+
+    mode:
+      - "nearest": 四舍五入到最近 tick
+      - "floor": 向下取整（不高于原价）
+      - "ceil": 向上取整（不低于原价）
+    """
     if tick_size <= 0:
         return price
-    rounded = round(price / tick_size) * tick_size
-    # 避免浮点尾差
+
+    scaled = price / tick_size
+    if mode == "floor":
+        # +eps 避免由于浮点误差导致 floor 少 1 个 tick
+        steps = math.floor(scaled + 1e-12)
+    elif mode == "ceil":
+        # -eps 避免由于浮点误差导致 ceil 多 1 个 tick
+        steps = math.ceil(scaled - 1e-12)
+    else:
+        steps = round(scaled)
+
+    rounded = steps * tick_size
     return float(f"{rounded:.6f}")
 
 
@@ -254,7 +272,8 @@ def compute_market_protect_price(
         protect_price = _clamp(protect_price, cage_sell, current_high)
         protect_price = _clamp(protect_price, current_low, None)
 
-    rounded = _round_to_tick(protect_price, tick)
+    # 保护价的语义：买入不应被 tick 对齐后抬高；卖出不应被 tick 对齐后压低
+    rounded = _round_to_tick(protect_price, tick, mode="floor" if is_buy else "ceil")
     # rounding 可能突破笼子，再次裁剪
     if is_buy:
         rounded = _clamp(rounded, current_low, current_high)
