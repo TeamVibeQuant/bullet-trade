@@ -209,3 +209,5 @@ logs/*
 
 .bullet-trade/*
 backtest_results/*
+cache/*
+.vscode/*
