@@ -1587,18 +1587,24 @@ class BacktestEngine:
                         log.info(f"{order.security} 可卖出不足，缩量为 {pos.closeable_amount}")
                         final_amount = pos.closeable_amount
                 
-                # 一手取整 + 最小申报量
-                final_amount = (final_amount // min_trade_size) * min_trade_size
-                # 如果买入订单不足一手，则取消订单
-                if is_buy and final_amount < min_trade_size:
-                    log.debug(f"{order.security} 数量不足最小申报量({min_order_amount})")
-                    order.status = OrderStatus.canceled
-                    continue
-                # 如果剩余的股数超过一手，但卖出订单不足一手，则取消卖出订单（如果剩余股数不足一手，则允许碎股卖出）
-                if (not is_buy) and pos.closeable_amount >= min_trade_size and final_amount < min_trade_size:
-                    log.debug(f"{order.security} 数量不足最小申报量({min_order_amount})")
-                    order.status = OrderStatus.canceled
-                    continue
+                if is_buy:
+                    # 买入：一手取整 + 最小申报量
+                    final_amount = (final_amount // min_trade_size) * min_trade_size
+                    if final_amount < min_trade_size:
+                        log.debug(f"{order.security} 买入数量 {final_amount} 不足最小申报量({min_order_amount})")
+                        order.status = OrderStatus.canceled
+                        continue
+                else:
+                    # 如果剩余的股数超过一手，但卖出订单不足一手，则取消卖出订单（如果剩余股数不足一手，则允许碎股卖出）
+                    if pos.closeable_amount >= min_trade_size:
+                        final_amount = (final_amount // min_trade_size) * min_trade_size
+                        if final_amount < min_trade_size:
+                            log.debug(f"{order.security} 卖出数量 {final_amount} 不足最小申报量({min_order_amount})")
+                            order.status = OrderStatus.canceled
+                            continue
+                    else:
+                        log.debug(f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出")
+                        final_amount = final_amount
                 
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
