@@ -1589,7 +1589,13 @@ class BacktestEngine:
                 
                 # 一手取整 + 最小申报量
                 final_amount = (final_amount // min_trade_size) * min_trade_size
-                if final_amount < min_order_amount:
+                # 如果买入订单不足一手，则取消订单
+                if is_buy and final_amount < min_trade_size:
+                    log.debug(f"{order.security} 数量不足最小申报量({min_order_amount})")
+                    order.status = OrderStatus.canceled
+                    continue
+                # 如果剩余的股数超过一手，但卖出订单不足一手，则取消卖出订单（如果剩余股数不足一手，则允许碎股卖出）
+                if (not is_buy) and pos.closeable_amount >= min_trade_size and final_amount < min_trade_size:
                     log.debug(f"{order.security} 数量不足最小申报量({min_order_amount})")
                     order.status = OrderStatus.canceled
                     continue
