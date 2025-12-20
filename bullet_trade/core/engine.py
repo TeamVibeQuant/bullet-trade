@@ -160,6 +160,7 @@ class BacktestEngine:
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
         self._split_price_adjustments: Dict[Tuple[str, date], Dict[str, float]] = {}
+        self.benchmark = benchmark
         self.benchmark_data = None  # 基准数据
         # 新增：每日持仓快照记录
         self.daily_positions = []
@@ -407,6 +408,7 @@ class BacktestEngine:
         module.get_price = wrapped_api.get_price
         module.history = wrapped_api.history
         module.get_concept_stocks = wrapped_api.get_concept_stocks
+        module.get_factor_values = wrapped_api.get_factor_values
         module.attribute_history = wrapped_api.attribute_history
         module.get_bars = wrapped_api.get_bars
         module.get_ticks = wrapped_api.get_ticks
@@ -472,6 +474,7 @@ class BacktestEngine:
         jq_mod.get_price = wrapped_api.get_price
         jq_mod.history = wrapped_api.history
         jq_mod.get_concept_stocks = wrapped_api.get_concept_stocks
+        jq_mod.get_factor_values = wrapped_api.get_factor_values
         jq_mod.attribute_history = wrapped_api.attribute_history
         jq_mod.get_bars = wrapped_api.get_bars
         jq_mod.get_ticks = wrapped_api.get_ticks

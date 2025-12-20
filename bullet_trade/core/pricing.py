@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 from typing import Optional, Tuple, Any, Dict
 
 
@@ -235,11 +236,26 @@ def _merge_upper(*values: Optional[float]) -> Optional[float]:
     return min(present) if present else None
 
 
-def _round_to_tick(price: float, tick_size: float) -> float:
+def _round_to_tick(price: float, tick_size: float, mode: str = "nearest") -> float:
+    """将价格对齐到最小价差。
+
+    mode:
+      - "nearest": 四舍五入到最近 tick
+      - "floor": 向下取整（不高于原价）
+      - "ceil": 向上取整（不低于原价）
+    """
     if tick_size <= 0:
         return price
-    rounded = round(price / tick_size) * tick_size
-    # 避免浮点尾差
+
+    scaled = price / tick_size
+    if mode == "floor":
+        steps = math.floor(scaled + 1e-12)
+    elif mode == "ceil":
+        steps = math.ceil(scaled - 1e-12)
+    else:
+        steps = round(scaled)
+
+    rounded = steps * tick_size
     return float(f"{rounded:.6f}")
 
 
@@ -322,21 +338,18 @@ def compute_market_protect_price(
     """
     base_price = float(last_price)
     if base_price <= 0:
-        # 尝试使用涨跌停作为基准
         fallback = high_limit if high_limit and high_limit > 0 else low_limit
         if not fallback:
             raise ValueError(f"{security} 缺少可用价格，无法计算保护价")
         base_price = float(fallback)
 
-    protect_price = base_price * (1.0 + percent)
-    rounded = clamp_price_to_trade_bounds(
-        security,
-        protect_price,
-        base_price,
-        high_limit,
-        low_limit,
-        is_buy,
-    )
+    tick = get_min_price_step(security, base_price)
+    lower, upper = compute_trade_price_bounds(security, base_price, high_limit, low_limit, is_buy)
+    protect_price = _clamp(base_price * (1.0 + percent), lower, upper)
+
+    # 保护价的语义：买入不应被 tick 对齐后抬高；卖出不应被 tick 对齐后压低。
+    rounded = _round_to_tick(protect_price, tick, mode="floor" if is_buy else "ceil")
+    rounded = _clamp(rounded, lower, upper)
 
     if rounded <= 0:
         raise ValueError(f"{security} 保护价无效: {rounded}")
