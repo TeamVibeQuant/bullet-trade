@@ -36,6 +36,7 @@ from ..data.api import (
     get_price as api_get_price,
     get_trade_days as api_get_trade_days,
     get_concept_stocks as api_get_concept_stocks,
+    get_factor_values as api_get_factor_values,
     get_data_provider,
     get_security_info,
 )
@@ -113,6 +114,7 @@ class BacktestEngine:
         self.trades = []  # 所有交易记录
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
+        self.benchmark = benchmark
         self.benchmark_data = None  # 基准数据
         # 新增：每日持仓快照记录
         self.daily_positions = []
@@ -284,6 +286,7 @@ class BacktestEngine:
         # 注入包装过的数据函数（支持真实价格和未来数据检测）
         module.get_price = wrapped_api.get_price
         module.get_concept_stocks = wrapped_api.get_concept_stocks
+        module.get_factor_values = wrapped_api.get_factor_values
         module.attribute_history = wrapped_api.attribute_history
         module.get_current_data = wrapped_api.get_current_data
         module.get_trade_days = wrapped_api.get_trade_days
@@ -325,6 +328,7 @@ class BacktestEngine:
         # 数据 API（包装层）
         jq_mod.get_price = wrapped_api.get_price
         jq_mod.get_concept_stocks = wrapped_api.get_concept_stocks
+        jq_mod.get_factor_values = wrapped_api.get_factor_values
         jq_mod.attribute_history = wrapped_api.attribute_history
         jq_mod.get_current_data = wrapped_api.get_current_data
         jq_mod.get_trade_days = wrapped_api.get_trade_days
@@ -1590,12 +1594,24 @@ class BacktestEngine:
                         log.info(f"{order.security} 可卖出不足，缩量为 {pos.closeable_amount}")
                         final_amount = pos.closeable_amount
                 
-                # 一手取整 + 最小申报量
-                final_amount = (final_amount // min_trade_size) * min_trade_size
-                if final_amount < min_order_amount:
-                    log.debug(f"{order.security} 数量不足最小申报量({min_order_amount})")
-                    order.status = OrderStatus.canceled
-                    continue
+                if is_buy:
+                    # 买入：一手取整 + 最小申报量
+                    final_amount = (final_amount // min_trade_size) * min_trade_size
+                    if final_amount < min_trade_size:
+                        log.debug(f"{order.security} 买入数量 {final_amount} 不足最小申报量({min_order_amount})")
+                        order.status = OrderStatus.canceled
+                        continue
+                else:
+                    # 如果剩余的股数超过一手，但卖出订单不足一手，则取消卖出订单（如果剩余股数不足一手，则允许碎股卖出）
+                    if pos.closeable_amount >= min_trade_size:
+                        final_amount = (final_amount // min_trade_size) * min_trade_size
+                        if final_amount < min_trade_size:
+                            log.debug(f"{order.security} 卖出数量 {final_amount} 不足最小申报量({min_order_amount})")
+                            order.status = OrderStatus.canceled
+                            continue
+                    else:
+                        log.debug(f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出")
+                        final_amount = final_amount
                 
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
