@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import hashlib
+from pathlib import Path
 from datetime import datetime, date as Date, timezone
 from typing import Any, Dict, Optional, Callable, List
 
@@ -190,7 +191,11 @@ class CacheManager:
         ext = "json"
         if result_type == "df":
             ext = "parquet" if self.default_df_format == "parquet" else "pkl"
-        data_path = os.path.join(base_dir, f"{key_hash}.{ext}")
+            data_path = os.path.join(base_dir, f"{key_hash}.{ext}")
+        elif result_type == "dict_df":
+            data_path = os.path.join(base_dir, f"{key_hash}_folder")
+        else:
+            data_path = os.path.join(base_dir, f"{key_hash}.{ext}")
         meta_path = os.path.join(base_dir, f"{key_hash}.meta.json")
         return data_path, meta_path
 
@@ -228,10 +233,31 @@ class CacheManager:
                     return pd.read_pickle(real_data_path)
                 except Exception:
                     return None
+            elif fmt == "list_of_parquet":
+                try:
+                    folder = Path(real_data_path)
+                    out = {}
+                    for p in folder.glob("*.parquet"):
+                        key = p.stem
+                        out[key] = pd.read_parquet(p, engine=engine)
+                    return out
+                except Exception:
+                    return None
+            elif fmt == "list_of_pkl":
+                try:
+                    folder = Path(real_data_path)
+                    out = {}
+                    for p in folder.glob("*.pkl"):
+                        key = p.stem
+                        out[key] = pd.read_pickle(p)
+                    return out
+                except Exception:
+                    return None
             else:
                 with open(real_data_path, "r", encoding="utf-8") as f:
                     return json.load(f)
         except Exception:
+            log.error("缓存读取失败, data_path:{}, meta_path:{}".format(data_path, meta_path))
             return None
 
     def _atomic_write(
@@ -249,6 +275,7 @@ class CacheManager:
             fmt = "json"
             tmp_data_path = data_path + ".tmp"
             root, _ = os.path.splitext(data_path)
+            
             if result_type == "df":
                 fmt = "parquet"
                 try:
@@ -260,6 +287,29 @@ class CacheManager:
                     fmt = "pkl"
                     result.to_pickle(tmp_data_path)
                     final_data_path = root + ".pkl"
+            
+            elif result_type == "dict_df":
+                fmt = "list_of_parquet"
+                final_data_path = tmp_data_path.replace(".tmp", "")
+                try:
+                    # 优先 parquet
+                    for key, df in result.items():
+                        if not isinstance(df, pd.DataFrame):
+                            raise ValueError("dict_df 中的值必须是 DataFrame")
+                    # 将多个 DataFrame 存为一个目录，文件名为 key.parquet
+                    os.makedirs(final_data_path, exist_ok=True)
+                    for key, df in result.items():
+                        df.to_parquet(os.path.join(final_data_path, f"{key}.parquet"))
+                except Exception:
+                    # 回退 pickle
+                    fmt = "list_of_pkl"
+                    for key, df in result.items():
+                        if not isinstance(df, pd.DataFrame):
+                            raise ValueError("dict_df 中的值必须是 DataFrame")
+                    os.makedirs(final_data_path, exist_ok=True)
+                    for key, df in result.items():
+                        df.to_pickle(os.path.join(final_data_path, f"{key}.pkl"))
+            
             else:
                 fmt = "json"
                 serializable = result
@@ -270,7 +320,8 @@ class CacheManager:
                     json.dump(serializable, f, ensure_ascii=False)
                 final_data_path = root + ".json"
 
-            os.replace(tmp_data_path, final_data_path)
+            if not fmt.startswith("list_of_"):
+                os.replace(tmp_data_path, final_data_path)
 
             # 写 meta
             expire_at = None
@@ -381,6 +432,8 @@ class CacheManager:
                 return [pd.to_datetime(x) for x in obj]
             except Exception:
                 return obj
+        if result_type == "dict_df":
+            return obj
         return obj
     @staticmethod
     def _to_date(value: Optional[Any]) -> Optional[Date]:
