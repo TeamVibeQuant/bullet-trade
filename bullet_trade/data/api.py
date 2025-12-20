@@ -1158,6 +1158,41 @@ def get_concept_stocks(
     
     # (tyb)TODO 可能需要考虑一些兼容性的问题，等碰到了再解决
 
+
+def get_factor_values(
+    securities: Union[str, List[str]],
+    factors: Union[str, List[str]],
+    start_date: Optional[Union[str, datetime]] = None,
+    end_date: Optional[Union[str, datetime]] = None,
+    count:Optional[int] = None
+) -> Dict[str, pd.DataFrame]:
+    """
+    获取因子数据（避免未来函数）
+    
+    Args:
+        securities:股票池，单只股票（字符串）或一个股票列表
+        factors: 因子名称，单个因子（字符串）或一个因子列表
+        start_date:开始日期，字符串或 datetime 对象，与 coun t参数二选一
+        end_date: 结束日期， 字符串或 datetime 对象，可以与 start_date 或 count 配合使用
+        count: 截止 end_date 之前交易日的数量（含 end_date 当日），与 start_date 参数二选一
+        
+    Returns:
+        一个 dict： key 是因子名称， value 是 pandas.dataframe。
+        dataframe 的 index 是日期， column 是股票代码， value 是因子值
+    """
+
+    # 确保数据提供者已认证
+    _ensure_auth()
+
+    return _provider.get_factor_values(
+        securities=securities,
+        factors=factors,
+        start_date=start_date,
+        end_date=end_date,
+        count=count
+    )        
+
+
 def _make_compatible_dataframe(df: pd.DataFrame, fields: Optional[List[str]]) -> pd.DataFrame:
     """
     让 DataFrame 兼容策略代码的访问方式
