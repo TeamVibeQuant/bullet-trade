@@ -373,6 +373,28 @@ class JQDataProvider(DataProvider):
             return jq.get_concept_stocks(kw.get('concept_code'), date=kw.get('date')) 
 
         return self._cache.cached_call('get_concept_stocks', kwargs, _fetch, result_type='list_str')
+    
+    def get_factor_values(self, securities: Union[str, List[str]], factors: Union[str, List[str]], 
+                          start_date: Optional[Union[str, datetime]] = None, 
+                          end_date: Optional[Union[str, datetime]] = None, count:Optional[int] = None):
+        kwargs = {
+            'securities': securities,
+            'factors': factors,
+            'start_date': start_date,
+            'end_date': end_date,
+            'count': count,
+        }
+
+        def _fetch(kw: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
+            return jq.get_factor_values(
+                securities=kw.get('securities'),
+                factors=kw.get('factors'),
+                start_date=kw.get('start_date'),
+                end_date=kw.get('end_date'),
+                count=kw.get('count'),
+            )
+        
+        return self._cache.cached_call('get_factor_values', kwargs, _fetch, result_type='dict_df')
 
     # ------------------------ Live 快照 ------------------------
     def get_live_current(self, security: str) -> Dict[str, Any]:
