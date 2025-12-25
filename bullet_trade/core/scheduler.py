@@ -46,6 +46,33 @@ def _coerce_time(value) -> Time:
     raise ValueError(f"无法解析时间: {value!r}")
 
 
+def _coerce_date(value) -> Optional[date]:
+    """将字符串/datetime/date 转换为 date；无法转换则返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        return None
+    return None
+
+
+def _get_backtest_start_date() -> Optional[date]:
+    """从 settings.options 读取回测 start_date（若存在）。"""
+    settings = get_settings()
+    return _coerce_date(settings.options.get("backtest_start_date"))
+
+
 def get_market_periods() -> List[Tuple[Time, Time]]:
     """获取配置的交易时段列表"""
     settings = get_settings()

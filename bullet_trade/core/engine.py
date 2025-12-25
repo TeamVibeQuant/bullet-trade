@@ -671,12 +671,14 @@ class BacktestEngine:
         from .settings import set_option
 
         set_option("backtest_frequency", self.frequency)
+        set_option("backtest_start_date", self.start_date.date())
 
         # 加载策略
         self.load_strategy()
 
         # 注意：load_strategy 内部会调用 reset_settings()，需要重新注入频率配置
         set_option("backtest_frequency", self.frequency)
+        set_option("backtest_start_date", self.start_date.date())
 
         # 初始化上下文
         self.context = Context(

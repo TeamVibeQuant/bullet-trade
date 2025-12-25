@@ -13,6 +13,7 @@ from bullet_trade.core.scheduler import (
     set_trade_calendar,
     unschedule_all,
 )
+from bullet_trade.core.settings import set_option
 
 
 @pytest.fixture(autouse=True)
