@@ -61,6 +61,12 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
 
+_provider_router = dict(
+    jqdata=_create_provider('jqdata'),
+    qmt=_create_provider('qmt'),
+)
+
+
 _provider: DataProvider = _create_provider()
 _auth_attempted = False
 _security_info_cache: Dict[str, "SecurityInfo"] = {}

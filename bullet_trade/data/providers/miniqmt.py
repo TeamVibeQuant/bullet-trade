@@ -683,6 +683,7 @@ class MiniQMTProvider(DataProvider):
         logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
         
         # xtquant 时间戳为毫秒级 UTC，需要转换到沪深时区（Asia/Shanghai）再处理
+        import ipdb; ipdb.set_trace()
         if "time" not in df.columns:
             logger.error(
                 f"QMT _fetch_local_data: 数据缺少 'time' 列！"
