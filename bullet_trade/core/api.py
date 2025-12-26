@@ -41,7 +41,8 @@ from ..data.api import (
     get_index_stocks, get_index_weights, get_industry_stocks, get_industry,
     get_concept_stocks, get_concept, get_margincash_stocks, get_marginsec_stocks,
     get_dominant_future, get_future_contracts, get_billboard_list, get_locked_shares,
-    get_split_dividend, set_data_provider, get_data_provider
+    get_split_dividend, set_data_provider, get_data_provider,
+    get_factor_values
 )
 from ..data.api import get_current_tick as _data_get_current_tick
 from ..research.io import read_file, write_file
