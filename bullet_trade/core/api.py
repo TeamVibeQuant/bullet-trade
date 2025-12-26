@@ -40,7 +40,8 @@ from ..data.api import (
     get_trade_days, get_all_securities,
     get_index_stocks,
     get_split_dividend,
-    set_data_provider, get_data_provider
+    set_data_provider, get_data_provider,
+    get_factor_values, get_concept_stocks
 )
 from ..research.io import read_file, write_file
 
