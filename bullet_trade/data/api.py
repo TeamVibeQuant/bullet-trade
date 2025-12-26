@@ -10,6 +10,7 @@ import pandas as pd
 import re
 import os
 import json
+import traceback
 
 
 from ..core.models import SecurityUnitData
@@ -42,6 +43,11 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
         provider_cfg = dict(config.get('jqdata', {}) or {})
         provider_cfg.update(overrides)
         return JQDataProvider(provider_cfg)
+    if target == "jqdatacache":
+        from .providers.jqdata_cache import JQDataCacheProvider
+        provider_cfg = dict(config.get('jqdatacache', {}) or {})
+        provider_cfg.update(overrides)
+        return JQDataCacheProvider(provider_cfg)
     if target in ('tushare',):
         from .providers.tushare import TushareProvider
         provider_cfg = dict(config.get('tushare', {}) or {})
@@ -746,6 +752,8 @@ def get_price(
             
         except Exception as e:
             log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
+            error_msg = traceback.format_exc()
+            log.info(error_msg)
     
     # 标准模式或真实价格模式失败时的回退策略
     try:
