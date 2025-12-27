@@ -52,6 +52,7 @@ __all__ = [
     
     # 数据API
     'get_price', 'attribute_history',
+    'live_get_price',
     'get_current_data',
     'get_trade_days', 'get_all_securities',
     'get_index_stocks',

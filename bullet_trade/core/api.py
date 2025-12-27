@@ -36,6 +36,7 @@ from .models import (
 # 导入数据API
 from ..data.api import (
     get_price, attribute_history,
+    live_get_price,
     get_current_data,
     get_trade_days, get_all_securities,
     get_index_stocks,
@@ -457,6 +458,7 @@ __all__ = [
     
     # 数据API
     'get_price', 'attribute_history',
+    'live_get_price',
     'get_current_data',
     'get_trade_days', 'get_all_securities',
     'get_index_stocks',

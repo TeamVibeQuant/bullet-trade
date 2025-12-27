@@ -58,6 +58,29 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
         provider_cfg.update(overrides)
         return RemoteQmtProvider(provider_cfg)
 
+    if target in ('live_mixed', 'mixed_live', 'live-mixed', 'mixed-live'):
+        from .providers.live_mixed import LiveMixedProvider
+
+        # 默认组合：历史/研究走 jqdata；实盘行情走 qmt/miniqmt
+        provider_cfg = {
+            'jqdata': dict(config.get('jqdata', {}) or {}),
+            'qmt': dict(config.get('qmt', {}) or {}),
+        }
+
+        # 支持 overrides 透传：允许传入 jqdata={...} / qmt={...} 做局部覆盖
+        for key in ('jqdata', 'qmt', 'miniqmt'):
+            if key in overrides and isinstance(overrides.get(key), dict):
+                provider_cfg_key = 'qmt' if key == 'miniqmt' else key
+                provider_cfg[provider_cfg_key].update(overrides.get(key) or {})
+
+        # 其余顶层字段（如果有）也合并进去
+        for k, v in overrides.items():
+            if k in ('jqdata', 'qmt', 'miniqmt'):
+                continue
+            provider_cfg[k] = v
+
+        return LiveMixedProvider(provider_cfg)
+
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
 
@@ -145,6 +168,54 @@ def get_data_provider() -> DataProvider:
     _maybe_disable_cache_for_live()
     _ensure_auth()
     return _provider
+
+
+def live_get_price(
+    security: Union[str, List[str]],
+    *,
+    frequency: str = '1m',
+    fields: Optional[List[str]] = None,
+    fq: str = 'none',
+    count: int = 1,
+    panel: bool = True,
+) -> pd.DataFrame:
+    """实盘获取最新行情。
+
+    设计目标：
+    - 在 mixed provider 下：强制走 miniQMT（更贴近实时）
+    - 在其他 provider 下：若 provider 支持 live_get_price 则使用；否则回退到 get_price(count=1)
+
+    返回值：与 get_price 兼容的 DataFrame（默认 1m 最新一根）。
+    """
+    _maybe_disable_cache_for_live()
+    _ensure_auth()
+    provider = _provider
+
+    fn = getattr(provider, 'live_get_price', None)
+    if callable(fn):
+        return fn(
+            security,
+            frequency=frequency,
+            fields=fields,
+            fq=fq,
+            count=count,
+            panel=panel,
+        )
+
+    return provider.get_price(
+        security=security,
+        start_date=None,
+        end_date=None,
+        frequency=frequency,
+        fields=fields,
+        skip_paused=False,
+        fq=fq,
+        count=count,
+        panel=panel,
+        fill_paused=True,
+        pre_factor_ref_date=None,
+        prefer_engine=False,
+    )
 
 
 def set_current_context(context):
