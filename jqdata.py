@@ -47,6 +47,7 @@ try:
         set_universe,
         # 数据API
         get_price,
+        live_get_price,
         attribute_history,
         get_current_data,
         get_trade_days,
@@ -112,6 +113,7 @@ except Exception:  # pragma: no cover
         set_commission,
         set_universe,
         get_price,
+        live_get_price,
         attribute_history,
         get_current_data,
         get_trade_days,
@@ -120,6 +122,8 @@ except Exception:  # pragma: no cover
         get_split_dividend,
         set_data_provider,
         get_data_provider,
+        get_factor_values,
+        get_concept_stocks,
         read_file,
         write_file,
         subscribe,
@@ -176,6 +180,7 @@ __all__ = [
 
     # 数据API
     'get_price', 'attribute_history',
+    'live_get_price',
     'get_current_data',
     'get_trade_days', 'get_all_securities',
     'get_index_stocks',
