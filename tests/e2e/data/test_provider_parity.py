@@ -84,6 +84,19 @@ def _check_prerequisites() -> None:
         )
 
 
+def _check_jqdata_prerequisites() -> None:
+    """只检查聚宽相关依赖与账号，用于不依赖 MiniQMT 的测试。"""
+    load_env()
+
+    _ensure_module("jqdatasdk", "pip install jqdatasdk")
+
+    if not os.getenv("JQDATA_USERNAME") or not os.getenv("JQDATA_PASSWORD"):
+        pytest.skip(
+            "缺少必要的环境变量：JQDATA_USERNAME/JQDATA_PASSWORD；"
+            "请在 .env 中配置聚宽账号后重试。"
+        )
+
+
 def _check_tushare_prerequisites() -> None:
     _ensure_module("tushare", "pip install tushare")
     if not os.getenv("TUSHARE_TOKEN"):
@@ -91,7 +104,7 @@ def _check_tushare_prerequisites() -> None:
 
 
 def _authenticate_tushare() -> TushareProvider:
-    provider = TushareProvider()
+    provider = TushareProvider({"cache_dir": None})
     try:
         provider.auth()
     except Exception as exc:  # pragma: no cover - depends on external credentials
@@ -117,7 +130,7 @@ def _assert_pre_diff(df_none: pd.DataFrame, df_pre: pd.DataFrame, label: str) ->
 
 def _authenticate_providers() -> Tuple[JQDataProvider, MiniQMTProvider]:
     """实例化并认证双数据源，同时记录关键调试信息。"""
-    jq = JQDataProvider()
+    jq = JQDataProvider({"cache_dir": None})
     try:
         jq.auth()
     except Exception as exc:  # pragma: no cover - depends on external credentials
@@ -303,10 +316,10 @@ def test_tushare_vs_jqdata_single_day() -> None:
     """
     验证 Tushare 与 JQData 在 2025-07-01 的前复权/未复权差异与口径一致性。
     """
-    _check_prerequisites()
+    _check_jqdata_prerequisites()
     _check_tushare_prerequisites()
 
-    jq = JQDataProvider()
+    jq = JQDataProvider({"cache_dir": None})
     try:
         jq.auth()
     except Exception as exc:  # pragma: no cover - depends on external credentials

@@ -256,7 +256,13 @@ class TushareProvider(DataProvider):
         end_dt = df.index.max()
         factor_df = self._fetch_adj_factor(security, start_dt, end_dt)
         if factor_df.empty or "adj_factor" not in factor_df.columns:
-            return df
+            fallback = self._build_adjusted_from_events(
+                security=security,
+                raw_df=df,
+                fq=fq,
+                pre_factor_ref_date=pre_factor_ref_date,
+            )
+            return fallback if not fallback.empty else df
 
         factor_df.index = pd.to_datetime(factor_df["trade_date"]).dt.normalize()
         merged = df.join(factor_df["adj_factor"], how="left")
@@ -292,6 +298,142 @@ class TushareProvider(DataProvider):
 
         merged.drop(columns=["adj_factor"], inplace=True, errors="ignore")
         return merged
+
+    def _build_adjusted_from_events(
+        self,
+        security: str,
+        raw_df: pd.DataFrame,
+        fq: str,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
+        if fq not in ("pre", "post"):
+            return pd.DataFrame()
+        if raw_df.empty:
+            return pd.DataFrame()
+        if fq == "post":
+            return pd.DataFrame()
+
+        def _to_date(value: Optional[Union[str, datetime, Date]]) -> Optional[Date]:
+            if value is None:
+                return None
+            try:
+                return pd.to_datetime(value).date()
+            except Exception:
+                return None
+
+        start_dt = raw_df.index.min()
+        end_dt = raw_df.index.max()
+        ref_date: Optional[Union[str, datetime, Date]] = None
+        if fq == "pre":
+            if pre_factor_ref_date is not None:
+                ref_date = pre_factor_ref_date
+            else:
+                latest_trade_day = self._latest_trade_day()
+                ref_date = latest_trade_day.date() if isinstance(latest_trade_day, datetime) else latest_trade_day
+                if ref_date is None:
+                    ref_date = Date.today()
+
+        start_date = _to_date(start_dt)
+        end_date = _to_date(ref_date if ref_date is not None else end_dt)
+        if start_date and end_date and end_date < start_date:
+            end_date = start_date
+
+        events = self.get_split_dividend(
+            security,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        if not events:
+            return pd.DataFrame()
+
+        price_cols = [col for col in ["open", "high", "low", "close"] if col in raw_df.columns]
+        if not price_cols:
+            return pd.DataFrame()
+
+        adj_df = raw_df.copy()
+        factors = pd.Series(1.0, index=adj_df.index)
+        # 基于分红/送转事件构建前复权因子
+        sorted_events = sorted(
+            (
+                {
+                    **event,
+                    "date": pd.to_datetime(event.get("date"), errors="coerce"),
+                }
+                for event in events
+            ),
+            key=lambda item: item["date"] if item["date"] is not pd.NaT else pd.Timestamp.max,
+        )
+        for event in sorted_events:
+            event_date = event.get("date")
+            if event_date is pd.NaT or event_date is None:
+                continue
+            event_day = event_date.date()
+            mask = adj_df.index.date < event_day
+            if not mask.any():
+                continue
+            try:
+                scale = float(event.get("scale_factor") or 1.0)
+            except Exception:
+                scale = 1.0
+            scale_factor = 1.0 / scale if scale and scale > 0 else 1.0
+            try:
+                cash = float(event.get("bonus_pre_tax") or 0.0)
+            except Exception:
+                cash = 0.0
+            try:
+                per_base = float(event.get("per_base") or 10.0)
+            except Exception:
+                per_base = 10.0
+            cash_per_share = cash / per_base if per_base > 0 else 0.0
+
+            preclose = None
+            if "pre_close" in adj_df.columns and event_day in adj_df.index.date:
+                preclose = float(adj_df.loc[adj_df.index.date == event_day, "pre_close"].iloc[0])
+            elif "preClose" in adj_df.columns and event_day in adj_df.index.date:
+                preclose = float(adj_df.loc[adj_df.index.date == event_day, "preClose"].iloc[0])
+            if preclose is None or preclose == 0.0:
+                prev = adj_df.index[adj_df.index.date < event_day]
+                if len(prev) > 0 and "close" in adj_df.columns:
+                    preclose = float(adj_df.loc[prev.max(), "close"])
+
+            cash_factor = 1.0
+            if cash_per_share and preclose and preclose > 0:
+                cash_factor = max((preclose - cash_per_share) / preclose, 0.0)
+            total_factor = scale_factor * cash_factor
+            if total_factor != 1.0:
+                factors.loc[mask] = factors.loc[mask] * total_factor
+
+        for col in price_cols:
+            adj_df[col] = adj_df[col].astype(float) * factors
+
+        return self._align_reference(raw_df, adj_df, pre_factor_ref_date)
+
+    @staticmethod
+    def _align_reference(
+        raw_df: pd.DataFrame,
+        adj_df: pd.DataFrame,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
+    ) -> pd.DataFrame:
+        if adj_df.empty or not pre_factor_ref_date:
+            return adj_df
+        try:
+            ref_dt = pd.to_datetime(pre_factor_ref_date)
+        except Exception:
+            return adj_df
+        if ref_dt not in raw_df.index or ref_dt not in adj_df.index:
+            return adj_df
+        try:
+            reference_raw = float(raw_df.loc[ref_dt, "close"])
+            reference_adj = float(adj_df.loc[ref_dt, "close"])
+        except Exception:
+            return adj_df
+        if reference_adj == 0.0:
+            return adj_df
+        scale = reference_raw / reference_adj
+        for col in ["open", "high", "low", "close"]:
+            if col in adj_df.columns:
+                adj_df[col] = adj_df[col] * scale
+        return adj_df
 
     def _latest_trade_day(self) -> Optional[datetime]:
         try:
@@ -341,7 +483,7 @@ class TushareProvider(DataProvider):
                 end_date=self._format_date(kw.get("end_date")),
                 fields="cal_date,is_open",
             )
-            open_days = df[df["is_open"] == 1]["cal_date"].tolist()
+            open_days = df[df["is_open"] == 1]["cal_date"].sort_values().tolist()
             if kw.get("count") and kw["count"] != -1:
                 open_days = open_days[-kw["count"] :]
             return open_days
