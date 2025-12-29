@@ -34,6 +34,8 @@ def normalize_frequency(freq: str) -> str:
         'week': 'weekly',
         'm': 'monthly',
         '1m': '1m',  # 注意：1m 是分钟，不是月！
+        'min': '1m',
+        'minute': '1m',
         'month': 'monthly',
     }
     # 分钟线保留原样（如 '5m'）
@@ -303,7 +305,7 @@ class JQDataCacheProvider(DataProvider):
 
         if is_min:
             # 如果时间是9:30，则将其改为9:31
-            if isinstance(start_date, datetime.datetime) and start_date.time() == datetime.time(9, 30):
+            if type(start_date) is datetime.datetime and start_date.time() == datetime.time(9, 30):
                 start_date = start_date.replace(minute=31)
             elif isinstance(start_date, str):
                 dt = datetime.datetime.fromisoformat(start_date)
@@ -322,8 +324,10 @@ class JQDataCacheProvider(DataProvider):
         else:
             if isinstance(end_date, str):
                 end_date = datetime.datetime.fromisoformat(end_date) if is_min else parse_date(end_date)
-            elif isinstance(end_date, datetime.date) and not isinstance(end_date, datetime.datetime):
+            elif type(end_date) is datetime.date and not type(end_date) is datetime.datetime:
                 end_date = datetime.datetime.combine(end_date, datetime.time(15, 0)) if is_min else end_date
+        if type(end_date) is datetime.date:
+            end_date = datetime.datetime.combine(end_date, datetime.time(15, 0))
         req_end = get_nearest_trade_day(trade_days, end_date.date(), direction='backward')
         if is_min:
             # 将end_date中的具体的小时和分钟时间取出来和req_end合并
@@ -355,9 +359,9 @@ class JQDataCacheProvider(DataProvider):
         else:
             if isinstance(start_date, str):
                 start_date = datetime.datetime.fromisoformat(start_date) if is_min else parse_date(start_date)
-            elif isinstance(start_date, datetime.date) and not isinstance(start_date, datetime.datetime):
+            elif type(start_date) is datetime.date and not type(start_date) is datetime.datetime:
                 start_date = datetime.datetime.combine(start_date, datetime.time(9, 31)) if is_min else start_date
-        if isinstance(start_date, datetime.date):
+        if type(start_date) is datetime.date:
             start_date = datetime.datetime.combine(start_date, datetime.time(9, 31))
         req_start = get_nearest_trade_day(trade_days, start_date.date(), direction='forward')
         if is_min:
@@ -857,19 +861,24 @@ class JQDataCacheProvider(DataProvider):
     ) -> pd.DataFrame:
         # return jq.get_price(security, start_date=to_date_str(start_date), end_date=to_date_str(end_date),
         #                  frequency=frequency, fields=fields, fq=fq, panel=False)
+        logger.warn("_fetch_price_from_remote: ", security, start_date, end_date, frequency, fields, fq)
         return jq.get_price(security, start_date=start_date, end_date=end_date,
                          frequency=frequency, fields=fields, fq=fq, panel=False)
                          
     def _fetch_full_trade_days(self) -> List[datetime.datetime]:
+        logger.warn("_fetch_full_trade_days")
         return jq.get_trade_days('1990-01-01', '2030-12-31')
 
     def _fetch_all_securities(self, types, date) -> pd.DataFrame:
+        logger.warn("_fetch_all_securities")
         return jq.get_all_securities(types, date)
 
     def _fetch_index_stocks(self, index_symbol, date) -> List[str]:
+        logger.warn("_fetch_index_stocks")
         return jq.get_index_stocks(index_symbol, date)
 
     def _fetch_concept_stocks(self, concept_code, date) -> List[str]:
+        logger.warn("_fetch_concept_stocks")
         return jq.get_concept_stocks(concept_code, date)
 
     def _fetch_factor_value_from_remote(
@@ -880,6 +889,7 @@ class JQDataCacheProvider(DataProvider):
         end_date: datetime.date
     ) -> pd.DataFrame:
         """从聚宽远程获取因子数据"""
+        logger.warn("_fetch_factor_value_from_remote: ", securities, factors, start_date, end_date)
         try:
             return jq.get_factor_values(
                 securities=securities,
@@ -1000,6 +1010,8 @@ class JQDataCacheProvider(DataProvider):
                 pass
             return events
         
+        logger.warn("_fetch_split_dividend")
+        # (tyb)TODO: 这里的缓存还有问题 
         return _fetch(kwargs)
     
     def _extract_ratio(self, row, ratio_fields, number_field):
