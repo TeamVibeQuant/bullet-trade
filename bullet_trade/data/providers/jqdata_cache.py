@@ -2,6 +2,7 @@ import os
 import pickle
 import datetime
 import threading
+import logging
 from typing import Optional, List, Dict, Any, Union, Tuple
 from abc import ABC, abstractmethod
 import pandas as pd
@@ -10,6 +11,8 @@ import jqdatasdk as jq
 from jqdatasdk import finance, query
 
 from .base import DataProvider
+
+logger = logging.getLogger(__name__)
 
 # ========================
 # 配置 & 工具
@@ -683,21 +686,87 @@ class JQDataCacheProvider(DataProvider):
         start_date: Optional[Union[str, datetime.datetime]] = None,
         end_date: Optional[Union[str, datetime.datetime]] = None
     ) -> List[Dict[str, Any]]:
-        s_str = to_date_str(start_date or "1990-01-01")
-        e_str = to_date_str(end_date or datetime.date.today())
-        cache_path = os.path.join(CACHE_DIR, "split_dividend", f"{security}_{s_str}_{e_str}.pkl")
-        cached = load_pickle_safe(cache_path)
-        if cached is not None:
-            record_cache_hit()
-            return cached
-
-        record_cache_miss()
-        result = self._fetch_split_dividend(security=security, start_date=s_str, end_date=e_str)
-        try:
-            save_pickle_safe(result, cache_path)
-        except Exception:
-            pass
-        return result
+        # 处理日期
+        req_start = parse_date(start_date or "1990-01-01")
+        req_end = parse_date(end_date or datetime.date.today())
+        
+        # 扩展为整季度范围进行缓存
+        cache_start, cache_end = align_to_quarter_range(req_start, req_end)
+        
+        # 缓存路径：按股票+季度范围
+        sec_key = security.replace('.', '_')
+        cache_filename = f"{sec_key}_{cache_start.strftime('%Y%m%d')}_{cache_end.strftime('%Y%m%d')}.pkl"
+        cache_path = os.path.join(CACHE_DIR, "split_dividend", cache_filename)
+        
+        cached_events = load_pickle_safe(cache_path)
+        need_fetch = False
+        
+        if cached_events is not None: # 这个目录只要存在就不需要缓存，需要确保，跑回测之前已经缓存过
+            # 检查缓存是否覆盖所需范围
+            if cached_events:
+                # 从缓存的事件中获取日期范围
+                cached_dates = [parse_date(event['date']) for event in cached_events if event.get('date')]
+                if cached_dates:
+                    # cache_min_date = min(cached_dates)
+                    # cache_max_date = max(cached_dates)
+                    
+                    # # 检查缓存是否覆盖请求的范围
+                    # if cache_min_date <= req_start and cache_max_date >= req_end:
+                    #     record_cache_hit()
+                    #     # 筛选出请求范围内的事件
+                    #     result = [
+                    #         event for event in cached_events 
+                    #         if event.get('date') and req_start <= parse_date(event['date']) <= req_end
+                    #     ]
+                    #     return result
+                    # else:
+                    #     need_fetch = True
+                    # 检查每个缓存记录的日期是否在请求范围内
+                    event_dates = sorted(cached_dates)
+                    for date in event_dates:
+                        if req_start <= date <= req_end:
+                            record_cache_hit()
+                            # 筛选出请求范围内的事件
+                            result = [
+                                event for event in cached_events 
+                                if event.get('date') and req_start <= parse_date(event['date']) <= req_end
+                            ]
+                            return result
+                    return [] # 分红日不在请求的时间范围内
+                else:
+                    # 缓存为空但存在，说明这个时间段没有分红送股事件
+                    record_cache_hit()
+                    return []
+            else:
+                # 缓存为空列表，说明这个季度没有分红送股事件
+                record_cache_hit() 
+                return []
+        else:
+            need_fetch = True
+        
+        if need_fetch:
+            record_cache_miss()
+            # 获取整个季度的数据以便缓存
+            all_events = self._fetch_split_dividend(
+                security=security, 
+                start_date=cache_start, 
+                end_date=cache_end
+            )
+            
+            # 保存季度缓存
+            try:
+                save_pickle_safe(all_events, cache_path)
+            except Exception:
+                pass
+            
+            # 筛选出请求范围内的事件
+            result = [
+                event for event in all_events 
+                if event.get('date') and req_start <= parse_date(event['date']) <= req_end
+            ]
+            return result
+        
+        return []
 
     def get_factor_values(
         self,
@@ -707,8 +776,6 @@ class JQDataCacheProvider(DataProvider):
         end_date: Optional[Union[str, datetime.datetime]] = None,
         count: Optional[int] = None
     ) -> Dict[str, pd.DataFrame]:
-        # 不需要做复权的操作，返回的值是按照后复权的方式计算出的，后复权的起始日期是上市日期，全都统一了
-
         # 异常处理，当end_date不为空时，start_date和count两个参数需要二选一
         if end_date is not None and start_date is not None and count is not None:
             raise ValueError("When end_date is specified, only one of start_date or count should be provided.")
@@ -727,21 +794,21 @@ class JQDataCacheProvider(DataProvider):
             end_date = datetime.date.today()
         else:
             end_date = parse_date(end_date)
-        req_end = get_nearest_trade_day(trade_days_list, end_date, direction='backward') # 向前对齐到最近交易日
+        req_end = get_nearest_trade_day(trade_days_list, end_date, direction='backward')
             
         if start_date is None:
             if count is not None:
                 # 根据count估算开始日期
                 trade_days_cur = self.get_trade_days(end_date=end_date)
                 if len(trade_days_cur) >= count:
-                    start_date = trade_days_cur[-count]
+                    start_date = trade_days_cur[-count].date()
                 else:
-                    start_date = trade_days_cur[0]
+                    start_date = trade_days_cur[0].date()
             else:
                 start_date = datetime.date(2015, 1, 1)
         else:
             start_date = parse_date(start_date)
-        req_start = get_nearest_trade_day(trade_days_list,start_date, direction='forward') # 向后对齐到最近交易日
+        req_start = get_nearest_trade_day(trade_days_list, start_date, direction='forward')
 
         # 如果start_date > end_date，直接返回空结果
         if req_start > req_end:
@@ -750,100 +817,94 @@ class JQDataCacheProvider(DataProvider):
         result = {}
         
         for factor in factor_list:
-            # 为每个因子创建缓存
+            # 为每个因子创建缓存目录
             factor_dir = os.path.join(CACHE_DIR, "factor_value", factor)
             ensure_dir(factor_dir)
             
-            # 根据时间范围扩展缓存（按季度）
+            # 按季度缓存：扩展到整季度范围
             cache_start, cache_end = align_to_quarter_range(req_start, req_end)
             
-            # 按股票分别缓存
+            # 缓存文件名：因子_季度开始_季度结束.pkl
+            cache_filename = f"{factor}_{cache_start.strftime('%Y%m%d')}_{cache_end.strftime('%Y%m%d')}.pkl"
+            cache_path = os.path.join(factor_dir, cache_filename)
+            
+            cached_df = load_pickle_safe(cache_path)
+            need_fetch = False
             factor_result_df = None
-            cached_securities = []
-            missing_securities = []
             
-            # 检查每个股票的缓存状态
-            for sec in sec_list:
-                sec_key = sec.replace('.', '_')
-                cache_filename = f"{sec_key}_{cache_start.strftime('%Y%m%d')}_{cache_end.strftime('%Y%m%d')}.pkl"
-                cache_path = os.path.join(factor_dir, cache_filename)
+            if cached_df is not None and not cached_df.empty:
+                # 检查缓存是否覆盖请求的股票和日期范围
+                cached_dates = pd.to_datetime(cached_df.index).date if hasattr(cached_df.index, 'date') else [pd.to_datetime(idx).date() for idx in cached_df.index]
+                cache_min_date = min(cached_dates) if cached_dates is not None else cache_end
+                cache_max_date = max(cached_dates) if cached_dates is not None else cache_start
                 
-                cached_series = load_pickle_safe(cache_path)
+                # 检查是否有所需的股票列
+                missing_stocks = [sec for sec in sec_list if sec not in cached_df.columns]
                 
-                if cached_series is not None:
-                    # 检查缓存是否覆盖所需范围
-                    cached_dates = pd.to_datetime(cached_series.index).date if hasattr(cached_series.index, 'date') else [pd.to_datetime(idx).date() for idx in cached_series.index]
-                    cache_min_date = min(cached_dates)
-                    cache_max_date = max(cached_dates)
+                if (cache_min_date <= req_start and cache_max_date >= req_end and not missing_stocks):
+                    # 缓存命中：覆盖了所需的时间和股票范围
+                    record_cache_hit()
                     
-                    if cache_min_date <= req_start and cache_max_date >= req_end:
-                        # 缓存命中
-                        record_cache_hit()
-                        cached_securities.append(sec)
-                        
-                        # 筛选所需的日期范围
-                        filtered_series = cached_series.loc[
-                            (pd.to_datetime(cached_series.index).date >= req_start) & 
-                            (pd.to_datetime(cached_series.index).date <= req_end)
-                        ]
-                        if count is not None:
-                            filtered_series = filtered_series.tail(count)
-                        
-                        # 构建结果DataFrame
-                        if factor_result_df is None:
-                            factor_result_df = pd.DataFrame(index=filtered_series.index)
-                        factor_result_df[sec] = filtered_series
-                        continue
-                
-                # 缓存未命中
-                record_cache_miss()
-                missing_securities.append(sec)
+                    # 筛选请求的日期和股票范围
+                    filtered_df = cached_df.loc[
+                        (pd.to_datetime(cached_df.index).date >= req_start) & 
+                        (pd.to_datetime(cached_df.index).date <= req_end),
+                        sec_list
+                    ]
+                    if count is not None:
+                        filtered_df = filtered_df.tail(count)
+                    
+                    factor_result_df = filtered_df
+                else:
+                    # 缓存部分命中或未命中
+                    need_fetch = True
+            else:
+                # 缓存完全未命中
+                need_fetch = True
             
-            # 如果有未缓存的股票，从远程获取
-            if missing_securities:
+            if need_fetch:
+                record_cache_miss()
+                
                 try:
-                    remote_df = self._fetch_factor_value_from_remote(
-                        securities=missing_securities,
+                    # 获取整个季度的数据进行缓存
+                    remote_result = self._fetch_factor_value_from_remote(
+                        securities=sec_list,
                         factors=[factor],
                         start_date=cache_start,
                         end_date=cache_end
                     )
                     
-                    remote_df_cur = remote_df.get(factor)
-                    if remote_df_cur is not None and not remote_df_cur.empty:
-                        # 为每个股票单独保存缓存
-                        for sec in missing_securities:
-                            if sec in remote_df_cur.columns:
-                                sec_key = sec.replace('.', '_')
-                                cache_filename = f"{sec_key}_{cache_start.strftime('%Y%m%d')}_{cache_end.strftime('%Y%m%d')}.pkl"
-                                cache_path = os.path.join(factor_dir, cache_filename)
-                                
-                                try:
-                                    save_pickle_safe(remote_df_cur[sec], cache_path)
-                                except Exception:
-                                    pass
-                                
-                                # 筛选所需的日期范围
-                                filtered_series = remote_df_cur[sec].loc[
-                                    (pd.to_datetime(remote_df_cur.index).date >= req_start) & 
-                                    (pd.to_datetime(remote_df_cur.index).date <= req_end)
-                                ]
-                                if count is not None:
-                                    filtered_series = filtered_series.tail(count)
-                                
-                                # 构建结果DataFrame
-                                if factor_result_df is None:
-                                    factor_result_df = pd.DataFrame(index=filtered_series.index)
-                                factor_result_df[sec] = filtered_series
+                    remote_factor_df = remote_result.get(factor)
+                    if remote_factor_df is not None and not remote_factor_df.empty:
+                        # 保存季度缓存
+                        try:
+                            save_pickle_safe(remote_factor_df, cache_path)
+                        except Exception:
+                            pass
+                        
+                        # 筛选请求的日期范围
+                        filtered_df = remote_factor_df.loc[
+                            (pd.to_datetime(remote_factor_df.index).date >= req_start) & 
+                            (pd.to_datetime(remote_factor_df.index).date <= req_end)
+                        ]
+                        if count is not None:
+                            filtered_df = filtered_df.tail(count)
+                        
+                        # 只返回请求的股票列
+                        available_stocks = [sec for sec in sec_list if sec in filtered_df.columns]
+                        if available_stocks:
+                            factor_result_df = filtered_df[available_stocks]
+                        else:
+                            factor_result_df = pd.DataFrame()
+                    else:
+                        factor_result_df = pd.DataFrame()
                         
                 except Exception as e:
-                    print(f"Failed to fetch factor {factor}: {e}")
+                    logger.error(f"Failed to fetch factor {factor}: {e}")
+                    factor_result_df = pd.DataFrame()
             
             # 设置结果
-            if factor_result_df is not None and not factor_result_df.empty:
-                result[factor] = factor_result_df
-            else:
-                result[factor] = pd.DataFrame()
+            result[factor] = factor_result_df if factor_result_df is not None else pd.DataFrame()
         
         return result
 
@@ -861,24 +922,24 @@ class JQDataCacheProvider(DataProvider):
     ) -> pd.DataFrame:
         # return jq.get_price(security, start_date=to_date_str(start_date), end_date=to_date_str(end_date),
         #                  frequency=frequency, fields=fields, fq=fq, panel=False)
-        logger.warn("_fetch_price_from_remote: ", security, start_date, end_date, frequency, fields, fq)
+        logger.debug(f"_fetch_price_from_remote: {security}, {start_date}, {end_date}, {frequency}, {fields}, {fq}")
         return jq.get_price(security, start_date=start_date, end_date=end_date,
                          frequency=frequency, fields=fields, fq=fq, panel=False)
                          
     def _fetch_full_trade_days(self) -> List[datetime.datetime]:
-        logger.warn("_fetch_full_trade_days")
+        logger.debug("_fetch_full_trade_days")
         return jq.get_trade_days('1990-01-01', '2030-12-31')
 
     def _fetch_all_securities(self, types, date) -> pd.DataFrame:
-        logger.warn("_fetch_all_securities")
+        logger.debug("_fetch_all_securities")
         return jq.get_all_securities(types, date)
 
     def _fetch_index_stocks(self, index_symbol, date) -> List[str]:
-        logger.warn("_fetch_index_stocks")
+        logger.debug("_fetch_index_stocks")
         return jq.get_index_stocks(index_symbol, date)
 
     def _fetch_concept_stocks(self, concept_code, date) -> List[str]:
-        logger.warn("_fetch_concept_stocks")
+        logger.debug("_fetch_concept_stocks")
         return jq.get_concept_stocks(concept_code, date)
 
     def _fetch_factor_value_from_remote(
@@ -889,7 +950,7 @@ class JQDataCacheProvider(DataProvider):
         end_date: datetime.date
     ) -> pd.DataFrame:
         """从聚宽远程获取因子数据"""
-        logger.warn("_fetch_factor_value_from_remote: ", securities, factors, start_date, end_date)
+        logger.debug(f"_fetch_factor_value_from_remote: {securities}, {factors}, {start_date}, {end_date}")
         try:
             return jq.get_factor_values(
                 securities=securities,
@@ -898,7 +959,7 @@ class JQDataCacheProvider(DataProvider):
                 end_date=end_date
             )
         except Exception as e:
-            print(f"Error fetching factor values: {e}")
+            logger.error(f"Error fetching factor values: {e}")
             return pd.DataFrame()
             
     def _fetch_split_dividend(self, security: str,
@@ -1010,8 +1071,7 @@ class JQDataCacheProvider(DataProvider):
                 pass
             return events
         
-        logger.warn("_fetch_split_dividend")
-        # (tyb)TODO: 这里的缓存还有问题 
+        logger.debug(f"_fetch_split_dividend: {security}, {start_date}, {end_date}")
         return _fetch(kwargs)
     
     def _extract_ratio(self, row, ratio_fields, number_field):
