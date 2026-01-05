@@ -58,6 +58,9 @@ try:
         get_data_provider,
         get_factor_values,
         get_concept_stocks,
+        get_concept,
+        get_fundamentals,
+        get_extras,
         # 研究文件读写
         read_file,
         write_file,
@@ -186,7 +189,7 @@ __all__ = [
     'get_index_stocks',
     'get_split_dividend',
     'set_data_provider', 'get_data_provider',
-    'get_factor_values', 'get_concept_stocks',
+    'get_factor_values', 'get_concept_stocks', 'get_concept', 'get_fundamentals', 'get_extras',
 
     # 研究文件读写
     'read_file', 'write_file',
