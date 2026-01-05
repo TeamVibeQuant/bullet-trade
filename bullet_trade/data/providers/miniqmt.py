@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
+from copy import deepcopy
 from datetime import date as Date
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
 
 import pandas as pd
 
@@ -2051,6 +2054,7 @@ class MiniQMTProvider(DataProvider):
             return {}
 
     def batch_get_live_current(self, securities: List[str]) -> Dict[str, Dict[str, Any]]:
+        securities = deepcopy(securities)
         logger.debug(f"QMT batch_get_live_current")
         xt = self._ensure_xtdata()
         for i, security in enumerate(securities):
@@ -2060,7 +2064,7 @@ class MiniQMTProvider(DataProvider):
             st_sector = set(xt.get_stock_list_in_sector('ST股'))
             results = {}
             for code in securities:
-                results[code] = {}
+                results[self._to_jq_code(code)] = {}
                 if code not in full_ticks:
                     continue
                 tick_map = full_ticks[code]
@@ -2078,7 +2082,7 @@ class MiniQMTProvider(DataProvider):
                 else:
                     start_date = self._to_date(start_date)
                 end_date = info.get('ExpireDate')
-                if end_date in ['0', '99999999', 0, 99999999] or end_date < 19900101:
+                if end_date in ['0', '99999999', 0, 99999999] or np.int64(end_date) < 19900101:
                     end_date = None
                 else:
                     end_date = self._to_date(end_date)
@@ -2091,7 +2095,7 @@ class MiniQMTProvider(DataProvider):
                 except Exception as e:
                     print(e)
                     pass
-                results[code] = {
+                results[self._to_jq_code(code)] = {
                     'last_price': last_price,
                     'high_limit': high_limit,
                     'low_limit': low_limit,
