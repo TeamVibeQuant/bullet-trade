@@ -36,7 +36,7 @@ from .models import (
 # 导入数据API
 from ..data.api import (
     get_price, history, attribute_history, get_bars, get_ticks,
-    live_get_price,
+    live_get_price, get_live_current, batch_get_live_current,
     get_current_data, get_extras, get_fundamentals, get_fundamentals_continuously,
     get_trade_days, get_trade_day, get_all_securities, get_security_info, get_fund_info,
     get_index_stocks, get_index_weights, get_industry_stocks, get_industry,

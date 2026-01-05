@@ -409,6 +409,40 @@ def live_get_price(
     )
 
 
+def get_live_current(security: str) -> Dict[str, Any]:
+    """实盘获取最新快照数据（tick 优先）。"""
+    _maybe_disable_cache_for_live()
+    _ensure_auth()
+    provider = _provider
+
+    fn = getattr(provider, 'get_live_current', None)
+    if callable(fn):
+        return fn(security)
+
+    raise NotImplementedError("当前数据提供者不支持 get_live_current 方法")
+
+
+def batch_get_live_current(securities: List[str]) -> Dict[str, Any]:
+    """批量获取实盘最新快照数据（tick 优先）。"""
+    _maybe_disable_cache_for_live()
+    _ensure_auth()
+    provider = _provider
+
+    fn = getattr(provider, 'batch_get_live_current', None)
+    if callable(fn):
+        return fn(securities)
+
+    # 回退到逐个获取
+    results: Dict[str, Any] = {}
+    for sec in securities:
+        try:
+            results[sec] = get_live_current(sec)
+        except Exception as e:
+            log.debug(f"获取{sec}实盘快照失败: {e}")
+            results[sec] = None
+    return results
+
+
 def set_current_context(context):
     """设置当前回测上下文"""
     global _current_context
@@ -1208,12 +1242,13 @@ def get_price(
             return df
         
         # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
-        # return _make_compatible_dataframe(df, fields)
+        return _make_compatible_dataframe(df, fields)
         
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
         return pd.DataFrame()
+
 
 def get_concept_stocks(
     concept_code: list = [],

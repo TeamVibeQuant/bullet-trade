@@ -1043,6 +1043,7 @@ class MiniQMTProvider(DataProvider):
                 return {}
             last_price = float(t.get('lastPrice'))
             info = xt.get_instrument_detail(code)
+            is_st = 'ST' in info.get('InstrumentName', '').upper()
             high_limit = float(info.get('UpStopPrice') or 0.0) if isinstance(info, dict) else 0.0
             low_limit = float(info.get('DownStopPrice') or 0.0) if isinstance(info, dict) else 0.0
             paused = False
@@ -1088,8 +1089,64 @@ class MiniQMTProvider(DataProvider):
                 'high_limit': high_limit,
                 'low_limit': low_limit,
                 'paused': paused,
+                'is_st': is_st,
             }
         except Exception:
+            return {}
+    
+    def batch_get_live_current(self, securities: List[str]) -> Dict[str, Dict[str, Any]]:
+        logger.debug(f"QMT batch_get_live_current")
+        xt = self._ensure_xtdata()
+        for i, security in enumerate(securities):
+            securities[i] = self._normalize_security_code(security)
+        try:
+            full_ticks = xt.get_full_tick(securities)
+            st_sector = set(xt.get_stock_list_in_sector('ST股'))
+            results = {}
+            for code in securities:
+                results[code] = {}
+                if code not in full_ticks:
+                    continue
+                tick_map = full_ticks[code]
+                if not tick_map or tick_map.get('lastPrice') is None:
+                    return {}
+                last_price = float(tick_map.get('lastPrice'))
+                info = xt.get_instrument_detail(code)
+                is_st = 'ST' in info.get('InstrumentName', '').upper() or code in st_sector
+                high_limit = float(info.get('UpStopPrice') or 0.0) if isinstance(info, dict) else 0.0
+                low_limit = float(info.get('DownStopPrice') or 0.0) if isinstance(info, dict) else 0.0
+                # https://dict.thinktrader.net/dictionary/stock.html#%E5%8E%9F%E7%94%9Fpython
+                start_date = info.get('OpenDate')
+                if start_date in ['19700101', '19700102', '19700103', '19700104', '19700105', '19700106']:
+                    start_date = datetime.today().date()
+                else:
+                    start_date = self._to_date(start_date)
+                end_date = info.get('ExpireDate')
+                if end_date in ['0', '99999999', 0, 99999999] or end_date < 19900101:
+                    end_date = None
+                else:
+                    end_date = self._to_date(end_date)
+                paused = False
+
+                try:
+                    open_int = tick_map.get('openInt') if isinstance(tick_map, dict) else None
+                    if open_int is not None:
+                        paused = int(open_int) in (1, 17, 20)
+                except Exception as e:
+                    print(e)
+                    pass
+                results[code] = {
+                    'last_price': last_price,
+                    'high_limit': high_limit,
+                    'low_limit': low_limit,
+                    'start_date': start_date,
+                    'end_date': end_date,
+                    'paused': paused,
+                    'is_st': is_st,
+                }
+            return results
+        except Exception as e:
+            print(e)
             return {}
 
     def _get_xt_split_dividend(
