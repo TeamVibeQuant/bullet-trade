@@ -57,6 +57,7 @@ try:
         set_data_provider,
         get_data_provider,
         get_factor_values,
+        get_fundamentals,
         get_concept_stocks,
         get_concept,
         get_fundamentals,
