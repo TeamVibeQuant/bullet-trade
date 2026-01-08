@@ -39,6 +39,7 @@ from ..data.api import (
     get_trade_days as api_get_trade_days,
     get_concept_stocks as api_get_concept_stocks,
     get_factor_values as api_get_factor_values,
+    get_fundamentals as api_get_fundamentals,
     get_data_provider,
     get_security_info,
 )
@@ -291,6 +292,7 @@ class BacktestEngine:
         module.history = wrapped_api.history
         module.get_concept_stocks = wrapped_api.get_concept_stocks
         module.get_factor_values = wrapped_api.get_factor_values
+        module.get_fundamentals = wrapped_api.get_fundamentals
         module.attribute_history = wrapped_api.attribute_history
         module.get_bars = wrapped_api.get_bars
         module.get_ticks = wrapped_api.get_ticks
@@ -356,6 +358,7 @@ class BacktestEngine:
         jq_mod.history = wrapped_api.history
         jq_mod.get_concept_stocks = wrapped_api.get_concept_stocks
         jq_mod.get_factor_values = wrapped_api.get_factor_values
+        jq_mod.get_fundamentals = wrapped_api.get_fundamentals
         jq_mod.attribute_history = wrapped_api.attribute_history
         jq_mod.get_bars = wrapped_api.get_bars
         jq_mod.get_ticks = wrapped_api.get_ticks
