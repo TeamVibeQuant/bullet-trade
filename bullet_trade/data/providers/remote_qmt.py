@@ -113,6 +113,11 @@ class RemoteQmtProvider(DataProvider):
         payload = {"index_symbol": index_symbol, "date": date}
         resp = self._connection.request("data.get_index_stocks", payload)
         return resp.get("values") or []
+    
+    def batch_get_live_current(self, securities: List[str]):
+        payload = {"securities": ",".join(securities)}
+        resp = self._connection.request("data.batch_get_live_current", payload)
+        return resp.get("value") or {}
 
     def get_split_dividend(
         self,

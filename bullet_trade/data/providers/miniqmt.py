@@ -1084,8 +1084,8 @@ class MiniQMTProvider(DataProvider):
                     #paused = (int(open_int) != 13)
                     # 更准确的写法应该是：
                     paused = int(open_int) in (1, 17, 20)  # 或加上 16
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(e)
             return {
                 'last_price': last_price,
                 'high_limit': high_limit,
@@ -1093,7 +1093,8 @@ class MiniQMTProvider(DataProvider):
                 'paused': paused,
                 'is_st': is_st,
             }
-        except Exception:
+        except Exception as e:
+            logger.error(e)
             return {}
     
     def batch_get_live_current(self, securities: List[str]) -> Dict[str, Dict[str, Any]]:
