@@ -382,7 +382,7 @@ class LiveEngine:
                 hash_changed,
             )
         if hash_changed and self.after_code_changed_func:
-            await self._call_hook(self.after_code_changed_func)
+            await self._call_hook(self.after_code_changed_func)  # NOTE
 
         self._init_broker()
 
@@ -487,6 +487,7 @@ class LiveEngine:
             raise
 
     async def _ensure_trading_day(self, current_date: date) -> None:
+        self.context.previous_date = current_date - timedelta(days=1)
         if self._current_day == current_date:
             return
 
@@ -504,9 +505,10 @@ class LiveEngine:
             self._persist_strategy_start_date()
         try:
             provider = get_data_provider()
-            calendar_days = provider.get_trade_days(end_date=current_date, count=180) or []
+            calendar_days = provider.get_trade_days(end_date=current_date, count=180)
+            calendar_days = calendar_days if len(calendar_days) > 0 else []
             calendar_dates = [pd.to_datetime(d).date() for d in calendar_days]
-            if calendar_dates:
+            if len(calendar_dates) > 0:
                 set_trade_calendar(calendar_dates, self._strategy_start_date)
                 self._trade_calendar = get_trade_calendar()
                 if self.async_scheduler:
@@ -726,6 +728,10 @@ class LiveEngine:
                     )
                     remark = self._prepare_order_metadata(order)
                     order_id: Optional[str] = None
+                    order.amount = plan.amount
+                    order.action = 'open' if plan.is_buy else 'close'
+                    order.value = order_value
+                    order.price = price_value
                     if plan.is_buy:
                         order_id = await self.broker.buy(
                             plan.security,
@@ -2719,7 +2725,7 @@ class LiveEngine:
             log.debug(f"获取账户信息失败: {exc}")
             return {}
 
-    def _log_account_positions(self, summary: Dict[str, Any], limit: int = 8) -> None:
+    def _log_account_positions(self, summary: Dict[str, Any], limit: int = 888) -> None:
         """
         以 print_portfolio_info 风格输出券商账户概览，避免原始 list 噪音。
         """

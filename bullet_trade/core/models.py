@@ -374,6 +374,7 @@ class Order:
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    value: float = 0.0  # 订单总价值（仅供参考）
 
 
 @dataclass

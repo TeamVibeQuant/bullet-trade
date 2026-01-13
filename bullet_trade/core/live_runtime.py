@@ -111,7 +111,10 @@ def save_g() -> None:
         with open(tmp, 'wb') as f:
             pickle.dump(getattr(g, '_data', {}), f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, _g_path())
-    except Exception:
+        print(f'🛟 已保存 g 到 {_g_path()}')
+
+    except Exception as e:
+        print(f'🛟 保存 g 失败: {e}')
         pass
 
 
