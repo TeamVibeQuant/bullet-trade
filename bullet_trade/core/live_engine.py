@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as Time, date
 import importlib
@@ -35,7 +36,7 @@ from .events import (
     TradingDayStartEvent,
 )
 from .globals import g, log
-from .models import Context, Portfolio, Position, Order, OrderStyle
+from .models import Context, Portfolio, Position, Order, OrderStyle, OrderStatus
 from .runtime import set_current_engine
 from .scheduler import (
     get_market_periods,
@@ -652,6 +653,28 @@ class LiveEngine:
                         f"委托[{action_label}] {plan.security} 已提交，订单ID={order_id or '未知'}，"
                         f"数量={plan.amount}"
                     )
+                    
+                    log.info('等待获取订单状态...')
+                    try:
+                        interval = 0.5  # seconds
+                        order_status_timeout = 5  # seconds
+                        deadline = time.time() + order_status_timeout
+                        while time.time() < deadline:
+                            try:
+                                status_dict = await self.broker.get_order_status(order_id)
+                                status_dict = status_dict or {}
+                                st = status_dict.get('status', OrderStatus.open)
+                                if st:
+                                    order.status = st
+                                    log.info(f"订单状态: {order.status}")
+                                    break
+                            except Exception as e:
+                                log.debug(f"获取订单状态失败 in-while-loop: {e}")
+                                pass
+                            await asyncio.sleep(interval)
+                    except Exception as e:
+                        log.debug(f"获取订单状态失败: {e}")
+                    
                     if risk:
                         try:
                             risk.record_trade(order_value, action=action)

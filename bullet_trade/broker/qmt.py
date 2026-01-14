@@ -673,7 +673,7 @@ class QmtBroker(BrokerBase):
                 int(amount),
                 price_type,
                 price_to_use,
-                "bullet-trade",
+                "bullet-trade-vibe-quant",
             )
         except Exception as e:
             raise RuntimeError(f"QMT 下单失败: {e}") from e
