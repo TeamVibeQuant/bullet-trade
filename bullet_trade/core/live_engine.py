@@ -663,7 +663,7 @@ class LiveEngine:
                             try:
                                 status_dict = await self.broker.get_order_status(order_id)
                                 status_dict = status_dict or {}
-                                st = status_dict.get('status', OrderStatus.open)
+                                st = status_dict.get('status', 'open')
                                 if st:
                                     order.status = st
                                     log.info(f"[LiveEngine] 订单状态: {order.status}")
