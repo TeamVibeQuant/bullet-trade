@@ -64,11 +64,6 @@ def _create_provider(provider_name: Optional[str] = None, overrides: Optional[Di
         provider_cfg = dict(config.get('jqdata', {}) or {})
         provider_cfg.update(overrides)
         return JQDataProvider(provider_cfg)
-    if target == "jqdatacache":
-        from .providers.jqdata_cache import JQDataCacheProvider
-        provider_cfg = dict(config.get('jqdatacache', {}) or {})
-        provider_cfg.update(overrides)
-        return JQDataCacheProvider(provider_cfg)
     if target == "jqdatacache_v4":
         from .providers.jqdata_cache_v4 import JQDataCacheProvider
         provider_cfg = dict(config.get('jqdatacache_v4', {}) or {})
