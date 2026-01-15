@@ -141,7 +141,8 @@ def _worker_task(task: Dict[str, Any]) -> Dict[str, Any]:
         row['起始日期'] = meta.get('start_date') or start_date
         row['结束日期'] = meta.get('end_date') or end_date
         row['频率'] = frequency
-        row['初始资金'] = float(results['daily_records']['total_value'].iloc[0]) if len(results['daily_records']) else initial_cash
+        row['初始资金'] = initial_cash
+        row['首日总资产'] = float(results['daily_records']['total_value'].iloc[0]) if len(results['daily_records']) else initial_cash
 
         # 运行耗时
         row['耗时秒'] = round(time.time() - start_ts, 3)
@@ -157,6 +158,7 @@ def _worker_task(task: Dict[str, Any]) -> Dict[str, Any]:
         row['结束日期'] = end_date
         row['频率'] = frequency
         row['初始资金'] = initial_cash
+        row['首日总资产'] = initial_cash
     return row
 
 
@@ -447,7 +449,7 @@ def generate_param_search_report(
 
     # 推断参数列（排除明显的指标与元信息）
     if not param_columns:
-        meta_cols = {'算法ID', '策略文件', '起始日期', '结束日期', '频率', '初始资金', '耗时秒', '错误'}
+        meta_cols = {'算法ID', '策略文件', '起始日期', '结束日期', '频率', '初始资金', '首日总资产', '耗时秒', '错误'}
         metric_keywords = ['收益', '回撤', '夏普', '胜率', '波动', 'Calmar', '卡玛']
         param_columns = [
             c for c in df.columns
