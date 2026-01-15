@@ -734,6 +734,10 @@ class QmtBroker(BrokerBase):
                         else:
                             order_price = price
                         mapped_status = self._map_order_status(status)
+                        log.debug(
+                            f"[QmtBroker] 查询订单状态: order_id={order_id}, "
+                            f"status={mapped_status}, raw_status={status}"
+                        )
                         _emit_order_debug(
                             "order_status_raw",
                             order_id=str(oid),
