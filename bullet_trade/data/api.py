@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import re
+import traceback
 from datetime import date as Date
 from datetime import datetime
 from datetime import time as Time
@@ -47,6 +48,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
     lowered = name.lower()
     if lowered in ("jqdata", "jqdatasdk"):
         return "jqdata"
+    if lowered in ("jqdatacache_v4", "jqdata_cache_v4", "jqdata-cache-v4"):
+        return "jqdatacache_v4"
     if lowered in ("qmt", "miniqmt"):
         return "miniqmt"
     if lowered in ("qmt-remote", "remote-qmt", "remote_qmt"):
@@ -74,6 +77,12 @@ def _create_provider(
         provider_cfg = dict(config.get("jqdata", {}) or {})
         provider_cfg.update(overrides)
         return JQDataProvider(provider_cfg)
+    if target == "jqdatacache_v4":
+        from .providers.jqdata_cache_v4 import JQDataCacheProvider
+
+        provider_cfg = dict(config.get("jqdatacache_v4", {}) or {})
+        provider_cfg.update(overrides)
+        return JQDataCacheProvider(provider_cfg)
     if target in ("tushare",):
         from .providers.tushare import TushareProvider
 
@@ -262,9 +271,7 @@ def _bind_sdk_fallback(provider: DataProvider, provider_name: str) -> None:
     setattr(provider, "_sdk_fallback", _resolver)
 
 
-_provider: DataProvider = _create_provider()
-_bind_sdk_fallback(_provider, _normalize_provider_name(getattr(_provider, "name", None)))
-_provider_cache[_normalize_provider_name(getattr(_provider, "name", None))] = _provider
+_provider: Optional[DataProvider] = None
 _auth_attempted = False
 _security_info_cache: Dict[Any, "SecurityInfo"] = {}
 _security_overrides_loaded = False
@@ -2437,6 +2444,7 @@ def get_price(
         except Exception as e:
             _raise_if_not_implemented(e)
             log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
+            log.info(traceback.format_exc())
             final = None
         if final is not None:
             _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
