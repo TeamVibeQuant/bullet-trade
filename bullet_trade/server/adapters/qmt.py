@@ -243,6 +243,19 @@ class QmtDataAdapter(RemoteDataAdapter):
 
         events = await _run_in_qmt_executor(_call)
         return {"events": events or []}
+    
+    async def batch_get_live_current(self, payload: Dict) -> Dict:
+        securities = payload.get("securities") or ''
+        if securities:
+            securities = securities.split(',')
+        else:
+            return {"dtype": "dict", "value": {}}
+
+        def _call():
+            return self.provider.batch_get_live_current(securities)
+
+        snapshots = await _run_in_qmt_executor(_call)
+        return {"dtype": "dict", "value": snapshots or {}}
 
 
 class QmtBrokerAdapter(RemoteBrokerAdapter):

@@ -367,6 +367,7 @@ class QmtBroker(BrokerBase):
                                 break
                     if str(oid) == str(order_id):
                         mapped_status = self._map_order_status(status)
+                        log.info(f"[QmtBroker] 查询订单状态: order_id={order_id}, status={mapped_status}, raw_status={status}")
                         return {
                             "order_id": str(oid),
                             "status": mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
@@ -673,7 +674,7 @@ class QmtBroker(BrokerBase):
                 int(amount),
                 price_type,
                 price_to_use,
-                "bullet-trade",
+                "bullet-trade-vibe-quant",
             )
         except Exception as e:
             raise RuntimeError(f"QMT 下单失败: {e}") from e
@@ -854,9 +855,15 @@ class QmtBroker(BrokerBase):
                             market_value = float(last) * float(qty or 0)
                         except Exception:
                             market_value = None
+                    try:
+                        from xtquant import xtdata  # type: ignore
+                        name = xtdata.get_instrument_detail(code).get("InstrumentName")
+                    except Exception:
+                        name = None
                     positions.append(
                         {
                             "security": self._map_to_jq_symbol(code),
+                            "name": name,
                             "amount": int(qty or 0),
                             "closeable_amount": int(avail or 0),
                             "avg_cost": float(avg_cost or 0.0),

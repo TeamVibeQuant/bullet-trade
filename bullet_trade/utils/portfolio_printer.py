@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Sequence
 import unicodedata
 
 
-def render_account_overview(snapshot: Dict[str, Any], limit: int = 20) -> str:
+def render_account_overview(snapshot: Dict[str, Any], limit: int = 888) -> str:
     try:
         positions = list(snapshot.get("positions") or [])
         total_value = _to_float(snapshot.get("total_value"))
