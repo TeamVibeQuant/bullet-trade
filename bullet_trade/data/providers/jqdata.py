@@ -849,6 +849,7 @@ class JQDataProvider(DataProvider):
             result,
             fq=fq,
             drop_factor=added_factor,
+            pre_factor_ref_date=pre_factor_ref_date,
         )
 
     def _prepare_fields_with_factor(
@@ -875,6 +876,7 @@ class JQDataProvider(DataProvider):
         data: Any,
         fq: str,
         drop_factor: bool,
+        pre_factor_ref_date: Optional[Union[str, datetime]],
     ) -> Any:
         if data is None:
             return data
@@ -884,22 +886,22 @@ class JQDataProvider(DataProvider):
             working = data.copy()
         except Exception:
             working = data
-        adjusted = self._adjust_dataframe_result(working)
+        adjusted = self._adjust_dataframe_result(working, pre_factor_ref_date=pre_factor_ref_date)
         if drop_factor:
             adjusted = self._drop_factor_from_result(adjusted)
         return adjusted
-    def _adjust_dataframe_result(self, data: Any) -> Any:
+    def _adjust_dataframe_result(self, data: Any, pre_factor_ref_date: Optional[Union[str, datetime]] = None) -> Any:
         if isinstance(data, pd.DataFrame):
-            return self._adjust_dataframe(data)
+            return self._adjust_dataframe(data, pre_factor_ref_date=pre_factor_ref_date)
         if hasattr(data, 'to_frame'):
             try:
                 df = data.to_frame()
             except Exception:
                 return data
-            return self._adjust_dataframe(df)
+            return self._adjust_dataframe(df, pre_factor_ref_date=pre_factor_ref_date)
         return data
 
-    def _adjust_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _adjust_dataframe(self, df: pd.DataFrame, pre_factor_ref_date: Optional[Union[str, datetime]] = None) -> pd.DataFrame:
         if df.empty:
             return df
         result_df = df.copy()
@@ -910,6 +912,8 @@ class JQDataProvider(DataProvider):
                 return result_df
             try:
                 factor_block = result_df.xs('factor', axis=1, level=0)
+                # TODO: factor_block因子值为pre_factor_ref_date那一天的因子值，而不是每一天的因子值，要做的是将因子值调整为相对于pre_factor_ref_date的因子值并拓展维度到所有日期，暂时没有实现，这个没有测试数据，不太方便
+                logger.error("没有实现完全！！！谨慎使用")
             except Exception:
                 return result_df
             ratio_df = self._compute_ratio_frame(factor_block)
@@ -923,29 +927,52 @@ class JQDataProvider(DataProvider):
                         continue
                     scaled = value_block.multiply(ratio_df, fill_value=0.0)
                     for code in scaled.columns:
+                        # 四舍五入到两位小数
+                        scaled[code] = scaled[code].round(2)
                         result_df[(field, code)] = scaled[code]
             return result_df
 
         base_cols = list(result_df.columns)
         has_factor = 'factor' in base_cols
         if has_factor and 'code' in base_cols and 'time' in base_cols:
-            return self._adjust_long_dataframe(result_df)
+            return self._adjust_long_dataframe(result_df, pre_factor_ref_date=pre_factor_ref_date)
         if has_factor:
-            ratio_series = self._compute_ratio_series(result_df['factor'])
+            # 临时hack一下，后面有时间需要重新调整，或者等上游修好
+            if 'code' not in base_cols:
+                ratio_series = self._compute_ratio_series(result_df['factor'])
+            else:
+                unique_codes = result_df['code'].unique()
+                ref_date_data = self.get_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
+                factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
+                result_df['ref_factor'] = result_df['code'].map(factor_map).fillna(1.0)
+                ratio_series = self._compute_ratio_series(result_df['ref_factor'])
             for field in self._PRICE_SCALE_FIELDS:
                 if field in result_df.columns:
                     result_df[field] = result_df[field].multiply(ratio_series, fill_value=0.0)
+                    # 四舍五入到两位小数
+                    result_df[field] = result_df[field].round(2)
             return result_df
         return result_df
 
-    def _adjust_long_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _adjust_long_dataframe(self, df: pd.DataFrame, pre_factor_ref_date: Optional[Union[str, datetime]] = None) -> pd.DataFrame:
         working = df.copy()
         if 'time' not in working.columns or 'code' not in working.columns or 'factor' not in working.columns:
             return working
-        ratio = self._compute_ratio_series(working['factor'])
+        # 输入给_compute_ratio_series的因子值为pre_factor_ref_date那一天的因子值，而不是每一天的因子值，要做的是将因子值调整为相对于pre_factor_ref_date的因子值并拓展维度到所有日期
+        # 临时hack一下，后面有时间需要重新调整，或者等上游修好
+        if 'code' not in working.columns:
+            ratio = self._compute_ratio_series(working['factor'])
+        else:
+            unique_codes = working['code'].unique()
+            ref_date_data = self.get_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
+            factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
+            working['ref_factor'] = working['code'].map(factor_map).fillna(1.0)
+            ratio = self._compute_ratio_series(working['ref_factor'])
         for field in self._PRICE_SCALE_FIELDS:
             if field in working.columns:
                 working[field] = working[field] * ratio
+                # 四舍五入到两位小数
+                working[field] = working[field].round(2)
         return working
 
     def _compute_ratio_frame(self, factor_df: pd.DataFrame) -> Optional[pd.DataFrame]:
