@@ -367,6 +367,7 @@ class QmtBroker(BrokerBase):
                                 break
                     if str(oid) == str(order_id):
                         mapped_status = self._map_order_status(status)
+                        log.info(f"[QmtBroker] 查询订单状态: order_id={order_id}, status={mapped_status}, raw_status={status}")
                         return {
                             "order_id": str(oid),
                             "status": mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,

@@ -47,7 +47,8 @@ try:
         set_universe,
         # 数据API
         get_price,
-        live_get_price,
+        get_live_current,
+        batch_get_live_current,
         attribute_history,
         get_current_data,
         get_trade_days,
@@ -116,7 +117,8 @@ except Exception:  # pragma: no cover
         set_commission,
         set_universe,
         get_price,
-        live_get_price,
+        get_live_current,
+        batch_get_live_current,
         attribute_history,
         get_current_data,
         get_trade_days,
@@ -183,7 +185,7 @@ __all__ = [
 
     # 数据API
     'get_price', 'attribute_history',
-    'live_get_price',
+    'get_live_current', 'batch_get_live_current',
     'get_current_data',
     'get_trade_days', 'get_all_securities',
     'get_index_stocks',

@@ -654,7 +654,7 @@ class LiveEngine:
                         f"数量={plan.amount}"
                     )
                     
-                    log.info('等待获取订单状态...')
+                    log.info('[LiveEngine] 等待获取订单状态...')
                     try:
                         interval = 0.5  # seconds
                         order_status_timeout = 5  # seconds
@@ -666,14 +666,14 @@ class LiveEngine:
                                 st = status_dict.get('status', OrderStatus.open)
                                 if st:
                                     order.status = st
-                                    log.info(f"订单状态: {order.status}")
+                                    log.info(f"[LiveEngine] 订单状态: {order.status}")
                                     break
                             except Exception as e:
-                                log.debug(f"获取订单状态失败 in-while-loop: {e}")
+                                log.debug(f"[LiveEngine] 获取订单状态失败 in-while-loop: {e}")
                                 pass
                             await asyncio.sleep(interval)
                     except Exception as e:
-                        log.debug(f"获取订单状态失败: {e}")
+                        log.debug(f"[LiveEngine] 获取订单状态失败: {e}")
                     
                     if risk:
                         try:
