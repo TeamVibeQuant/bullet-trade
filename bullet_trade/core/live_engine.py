@@ -467,7 +467,6 @@ class LiveEngine:
                     self.context.previous_date = day
                     log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
                     break
-            used_time = time.time() - now
         except Exception as exc:
             log.debug(f"获取前一个交易日失败: {exc}")
             self.context.previous_date = self._previous_trade_day
