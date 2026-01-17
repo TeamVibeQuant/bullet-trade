@@ -427,7 +427,6 @@ class LiveEngine:
             raise
 
     async def _ensure_trading_day(self, current_date: date) -> None:
-        self.context.previous_date = current_date - timedelta(days=1)
         if self._current_day == current_date:
             return
 
@@ -460,7 +459,18 @@ class LiveEngine:
         self._open_dt = open_dt
         self._close_dt = close_dt
         self._pre_open_dt = open_dt - PRE_MARKET_OFFSET
-        self.context.previous_date = self._previous_trade_day
+        try:
+            provider = get_data_provider()
+            previous_days = provider.get_trade_days(end_date=current_date, count=2)  # [previous date, current date]
+            for day in previous_days:
+                if day != current_date:
+                    self.context.previous_date = day
+                    log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
+                    break
+            used_time = time.time() - now
+        except Exception as exc:
+            log.debug(f"获取前一个交易日失败: {exc}")
+            self.context.previous_date = self._previous_trade_day
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))
         log.info(f"📅 新交易日：{current_date}")
