@@ -488,7 +488,6 @@ class LiveEngine:
             raise
 
     async def _ensure_trading_day(self, current_date: date) -> None:
-        self.context.previous_date = current_date - timedelta(days=1)
         if self._current_day == current_date:
             return
 
@@ -504,6 +503,7 @@ class LiveEngine:
         if self._strategy_start_date is None:
             self._strategy_start_date = current_date
             self._persist_strategy_start_date()
+        calendar_dates: List[date] = []
         try:
             provider = get_data_provider()
             calendar_days = provider.get_trade_days(end_date=current_date, count=180)
@@ -523,7 +523,14 @@ class LiveEngine:
         self._close_dt = close_dt
         self._pre_open_dt = open_dt - PRE_MARKET_OFFSET
         self._post_close_dt = close_dt + POST_MARKET_OFFSET
-        self.context.previous_date = self._previous_trade_day
+        previous_trade_day = self._previous_trade_day
+        if calendar_dates:
+            candidates = [day for day in calendar_dates if day < current_date]
+            if candidates:
+                previous_trade_day = candidates[-1]
+        if previous_trade_day is None:
+            previous_trade_day = current_date - timedelta(days=1)
+        self.context.previous_date = previous_trade_day
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))
         log.info(f"📅 新交易日：{current_date}")
