@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Sequence, Set, Tuple
 
-from .globals import g
+from .globals import g, log
 
 
 _runtime_dir: Optional[str] = None
@@ -95,8 +95,12 @@ def init_live_runtime(runtime_dir: str) -> None:
                 # 仅替换内部数据字典
                 g._data = data  # type: ignore[attr-defined]
                 _restored_from_disk = True
-    except Exception:
+                log.warn(f"** [live_runtime] 成功加载全局变量 g {g}")
+        else:
+            log.warn(f"init_live_runtime g 路径 {path} 不存在")
+    except Exception as e:
         # 读取失败不阻断
+        log.error("init_live_runtime 加载 g 失败")
         pass
 
 
