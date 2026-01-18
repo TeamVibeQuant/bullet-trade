@@ -532,6 +532,7 @@ class JQDataCacheProvider(DataProvider):
         
         # 处理股票列表
         securities = [security] if isinstance(security, str) else security
+        security_is_list = True if isinstance(security, list) else False
         
         # 获取交易日历
         if self._trade_days_cache is None:
@@ -612,15 +613,27 @@ class JQDataCacheProvider(DataProvider):
             )
 
         if fq != 'pre' or pre_factor_ref_date is None: # TODO 这里可能会有问题，加载指数的时候pre_factor_ref_date是None，但不确定指数是否有前复权因子
+            return_price = self.transform_price_fields(return_price, security_is_list)
+            # 删除factor列
+            if 'factor' in return_price.columns and 'factor' not in actual_fields:
+                return_price = return_price.drop(columns=['factor'])
             return return_price
         elif (not is_min and req_start >= pre_factor_ref_date) or \
              (is_min and start_date.date() >= pre_factor_ref_date):
             for field in self._PRICE_SCALE_FIELDS:
                 if field in return_price.columns:
                     return_price[field] = return_price[field] / return_price['factor'].round(2)
+            return_price = self.transform_price_fields(return_price, security_is_list)
+            # 删除factor列
+            if 'factor' in return_price.columns and 'factor' not in actual_fields:
+                return_price = return_price.drop(columns=['factor'])
             return return_price
         else:
             adjusted_dfs = self._adjust_dataframe_result(return_price, pre_factor_ref_date)
+            adjusted_dfs = self.transform_price_fields(adjusted_dfs, security_is_list)
+            # 删除factor列
+            if 'factor' in adjusted_dfs.columns and 'factor' not in actual_fields:
+                adjusted_dfs = adjusted_dfs.drop(columns=['factor'])
             return adjusted_dfs
     
     def _get_daily_price(
@@ -830,6 +843,17 @@ class JQDataCacheProvider(DataProvider):
         
         return result
 
+    def transform_price_fields(self, df: pd.DataFrame, security_is_list: bool) -> pd.DataFrame:
+
+        if security_is_list:
+            return df
+        else:
+            df.set_index("time", inplace=True)
+            df.index.name = None
+            if "code" in df.columns:
+                del df["code"]
+            return df
+
     def _adjust_dataframe_result(self, data: Any, pre_factor_ref_date: Optional[Union[str, datetime.datetime]]) -> Any:
         if isinstance(data, pd.DataFrame):
             return self._adjust_dataframe(data, pre_factor_ref_date)
@@ -881,8 +905,8 @@ class JQDataCacheProvider(DataProvider):
             unique_codes = result_df['code'].unique()
             ref_date_data = self._get_daily_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
             factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
-            result_df['ref_factor'] = result_df['code'].map(factor_map).fillna(1.0)
-            ratio_series = self._compute_ratio_series(result_df['ref_factor'])
+            ref_factor = result_df['code'].map(factor_map).fillna(1.0)
+            ratio_series = self._compute_ratio_series(ref_factor)
             for field in self._PRICE_SCALE_FIELDS:
                 if field in result_df.columns:
                     result_df[field] = result_df[field].multiply(ratio_series, fill_value=0.0)
@@ -912,8 +936,8 @@ class JQDataCacheProvider(DataProvider):
         unique_codes = working['code'].unique()
         ref_date_data = self._get_daily_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
         factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
-        working['ref_factor'] = working['code'].map(factor_map).fillna(1.0)
-        ratio = self._compute_ratio_series(working['ref_factor'])
+        ref_factor = working['code'].map(factor_map).fillna(1.0)
+        ratio = self._compute_ratio_series(ref_factor)
         for field in self._PRICE_SCALE_FIELDS:
             if field in working.columns:
                 working[field] = working[field] * ratio
@@ -1135,6 +1159,26 @@ class JQDataCacheProvider(DataProvider):
             result[factor] = filtered_df
         
         return result
+
+    def get_extras(
+        self,
+        info: str,
+        security_list: List[str],
+        start_date: Optional[Union[str, datetime.datetime]] = None,
+        end_date: Optional[Union[str, datetime.datetime]] = None,
+        df: bool = True,
+        count: Optional[int] = None,
+    ) -> Any:
+        # TODO(tyb): 这个暂时没有缓存，后面需要加入缓存
+
+        return jq.get_extras(
+            info,
+            security_list,
+            start_date=start_date,
+            end_date=end_date,
+            df=df,
+            count=count,
+        )
 
     # =================================================================
     # get_fundamentals：如果缓存了则使用缓存，否则加入缓存
