@@ -170,6 +170,11 @@ class JQDataProvider(DataProvider):
                   fields: Optional[List[str]] = None, skip_paused: bool = False, fq: str = 'pre',
                   count: Optional[int] = None, panel: bool = True, fill_paused: bool = True,
                   pre_factor_ref_date: Optional[Union[str, datetime]] = None, prefer_engine: bool = False) -> pd.DataFrame:
+        security_is_list = True
+        if type(security) == str:
+            security = [security]
+            security_is_list = False
+
         kwargs = {
             'security': security,
             'start_date': start_date,
@@ -228,23 +233,25 @@ class JQDataProvider(DataProvider):
                 result = self._cache.cached_call('get_price_engine', kwargs, _fetch_price_engine, result_type='df')
                 if self._price_engine_supported is None:
                     self._price_engine_supported = True
-                return result
+                return self.transform_price_fields(result, security_is_list)
             except Exception as exc:
                 if self._is_engine_missing_error(exc):
                     if self._price_engine_supported is not False:
                         logger.debug("检测到 get_price_engine 不可用，使用复权因子回退: %s", exc)
                     self._price_engine_supported = False
-                    return self._manual_prefactor_fallback(
+                    result = self._manual_prefactor_fallback(
                         kwargs,
                         _fetch_price,
                         fields,
                         pre_factor_ref_date,
                         fq,
                     )
-                raise
+                    
+                    return self.transform_price_fields(result, security_is_list)
+                raise 
 
         if should_try_engine and self._price_engine_supported is False:
-            return self._manual_prefactor_fallback(
+            result = self._manual_prefactor_fallback(
                 kwargs,
                 _fetch_price,
                 fields,
@@ -252,7 +259,20 @@ class JQDataProvider(DataProvider):
                 fq,
             )
 
-        return self._cache.cached_call('get_price', kwargs, _fetch_price, result_type='df')
+            return self.transform_price_fields(result, security_is_list)
+
+        return self.transform_price_fields(self._cache.cached_call('get_price', kwargs, _fetch_price, result_type='df'), security_is_list)
+
+    def transform_price_fields(self, df: pd.DataFrame, security_is_list: bool) -> pd.DataFrame:
+
+        if security_is_list:
+            return df
+        else:
+            df.set_index("time", inplace=True)
+            df.index.name = None
+            if "code" in df.columns:
+                del df["code"]
+            return df
 
     def get_security_info(
         self,
@@ -944,8 +964,8 @@ class JQDataProvider(DataProvider):
                 unique_codes = result_df['code'].unique()
                 ref_date_data = self.get_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
                 factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
-                result_df['ref_factor'] = result_df['code'].map(factor_map).fillna(1.0)
-                ratio_series = self._compute_ratio_series(result_df['ref_factor'])
+                ref_factor = result_df['code'].map(factor_map).fillna(1.0)
+                ratio_series = self._compute_ratio_series(ref_factor)
             for field in self._PRICE_SCALE_FIELDS:
                 if field in result_df.columns:
                     result_df[field] = result_df[field].multiply(ratio_series, fill_value=0.0)
@@ -966,8 +986,8 @@ class JQDataProvider(DataProvider):
             unique_codes = working['code'].unique()
             ref_date_data = self.get_price(unique_codes.tolist(), start_date=pre_factor_ref_date, end_date=pre_factor_ref_date, fields=['factor'], fq='pre', count=None)
             factor_map = dict(zip(ref_date_data['code'], ref_date_data['factor']))
-            working['ref_factor'] = working['code'].map(factor_map).fillna(1.0)
-            ratio = self._compute_ratio_series(working['ref_factor'])
+            ref_factor = working['code'].map(factor_map).fillna(1.0)
+            ratio = self._compute_ratio_series(ref_factor)
         for field in self._PRICE_SCALE_FIELDS:
             if field in working.columns:
                 working[field] = working[field] * ratio
