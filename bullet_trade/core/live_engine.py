@@ -464,7 +464,7 @@ class LiveEngine:
             previous_days = provider.get_trade_days(end_date=current_date, count=2)  # [previous date, current date]
             for day in previous_days:
                 if day != current_date:
-                    self.context.previous_date = day
+                    self.context.previous_date = day.date()
                     log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
                     break
         except Exception as exc:
