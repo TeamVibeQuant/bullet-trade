@@ -413,7 +413,7 @@ class LiveEngine:
             now = self._now()
             if not await self._calendar_guard.ensure_trade_day(now):
                 continue
-            await self._ensure_trading_day(now.date())
+            await self._ensure_trading_day(now)
             await self._handle_minute_tick(now)
             await self._sleep_until_next_minute(now)
 
@@ -426,7 +426,8 @@ class LiveEngine:
         except asyncio.CancelledError:
             raise
 
-    async def _ensure_trading_day(self, current_date: date) -> None:
+    async def _ensure_trading_day(self, now: datetime) -> None:
+        current_date = now.date()
         if self._current_day == current_date:
             return
 
@@ -440,10 +441,25 @@ class LiveEngine:
         if self.async_scheduler:
             self.async_scheduler.set_market_periods_resolver(lambda _ref=None: self._market_periods)
         if self._strategy_start_date is None:
-            self._strategy_start_date = current_date
+            # 如果收盘后启动，start_date 设为下一个交易日
+            close_time = self._market_periods[-1][1]  # 收盘时间
+            if now.time() > close_time:
+                try:
+                    provider = get_data_provider('jqdata')
+                    trade_days = provider.get_trade_days(start_date=current_date, count=2)
+                    if len(trade_days) >= 2:
+                        self._strategy_start_date = trade_days[1].date()
+                        log.info(f"📅 收盘后启动，start_date 设为下一个交易日 {self._strategy_start_date}")
+                except Exception as exc:
+                    log.error(f"📅 收盘后启动，start_date 设为下一个交易日, 获取下一个交易日失败: {exc}")
+                    self._strategy_start_date = current_date
+            else:
+                self._strategy_start_date = current_date
+            log.info(f"📅 策略开始交易日设为 {self._strategy_start_date}")
+        
         try:
-            provider = get_data_provider()
-            calendar_days = provider.get_trade_days(end_date=current_date, count=180)
+            provider = get_data_provider('jqdata')
+            calendar_days = provider.get_trade_days(end_date=current_date + timedelta(days=1), count=180)
             calendar_days = calendar_days if len(calendar_days) > 0 else []
             calendar_dates = [pd.to_datetime(d).date() for d in calendar_days]
             if len(calendar_dates) > 0:
@@ -452,7 +468,7 @@ class LiveEngine:
                 if self.async_scheduler:
                     self.async_scheduler.set_trade_calendar(self._trade_calendar)
         except Exception as exc:
-            log.debug(f"刷新交易日序号日历失败: {exc}")
+            log.error(f"刷新交易日序号日历失败: {exc}")
 
         open_dt = datetime.combine(current_date, self._market_periods[0][0])
         close_dt = datetime.combine(current_date, self._market_periods[-1][1])
@@ -460,7 +476,7 @@ class LiveEngine:
         self._close_dt = close_dt
         self._pre_open_dt = open_dt - PRE_MARKET_OFFSET
         try:
-            provider = get_data_provider()
+            provider = get_data_provider('jqdata')
             previous_days = provider.get_trade_days(end_date=current_date, count=2)  # [previous date, current date]
             for day in previous_days:
                 if day != current_date:
@@ -468,7 +484,7 @@ class LiveEngine:
                     log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
                     break
         except Exception as exc:
-            log.debug(f"获取前一个交易日失败: {exc}")
+            log.error(f"获取前一个交易日失败: {exc}")
             self.context.previous_date = self._previous_trade_day
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))

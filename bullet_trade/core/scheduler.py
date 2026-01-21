@@ -15,6 +15,7 @@ from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Any
 
 from .settings import get_settings
+from .globals import log
 
 
 # 默认交易时段（A股）
@@ -44,33 +45,6 @@ def _coerce_time(value) -> Time:
             except ValueError:
                 continue
     raise ValueError(f"无法解析时间: {value!r}")
-
-
-def _coerce_date(value) -> Optional[date]:
-    """将字符串/datetime/date 转换为 date；无法转换则返回 None。"""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        s = value.strip()
-        if not s:
-            return None
-        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
-            try:
-                return datetime.strptime(s, fmt).date()
-            except ValueError:
-                continue
-        return None
-    return None
-
-
-def _get_backtest_start_date() -> Optional[date]:
-    """从 settings.options 读取回测 start_date（若存在）。"""
-    settings = get_settings()
-    return _coerce_date(settings.options.get("backtest_start_date"))
 
 
 def get_market_periods() -> List[Tuple[Time, Time]]:
@@ -344,7 +318,6 @@ class ScheduleTask:
     time: str  # 原始表达式
     weekday: Optional[int] = None
     monthday: Optional[int] = None
-    force: bool = False
     expression: Optional[TimeExpression] = None
     reference_security: Optional[str] = None
     force: bool = True
@@ -678,7 +651,9 @@ def generate_daily_schedule(
             times = task.expression.resolve(trade_day, market_periods)
         elif stype_value == ScheduleType.MONTHLY.value:
             monthday = getattr(task, "monthday", None)
-            if monthday is None or not _should_trigger_monthly(day_info, monthday, getattr(task, "force", True)):
+            should_trigger_monthly = _should_trigger_monthly(day_info, monthday, getattr(task, "force", True))
+            log.debug(f"[generate_daily_schedule] 月度调度任务 {task.func.__name__} 判断结果: monthday={monthday}, should_trigger={should_trigger_monthly}, day_info={day_info}, force={getattr(task, 'force', True)}")
+            if monthday is None or not should_trigger_monthly:
                 continue
             times = task.expression.resolve(trade_day, market_periods)
         else:
@@ -686,8 +661,11 @@ def generate_daily_schedule(
 
         for dt in times:
             schedule[dt].append(task)
-
-    return {dt: schedule[dt] for dt in sorted(schedule.keys())}
+    res = {dt: schedule[dt] for dt in sorted(schedule.keys())}
+    log.info(f"[generate_daily_schedule] 生成交易日 {target_date} 调度表:")
+    for dt, tasks_at_time in res.items():
+        log.info(f"  时间 {dt.time()}: 任务 {[t.func.__name__ for t in tasks_at_time]}")
+    return res
 
 
 def get_tasks_to_run(current_dt: datetime, is_bar: bool = False) -> List[ScheduleTask]:
