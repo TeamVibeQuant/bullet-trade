@@ -559,13 +559,16 @@ class JQDataCacheProvider(DataProvider):
             
             if start_date is None:
                 if count is not None:
-                    # # 对于分钟线，我们需要估算大概的开始时间
-                    # # 每天约240个分钟（4小时），向前推count/240天
-                    days_back = max(1, count // 48 + 1)
-                    start_date = end_date - datetime.timedelta(days=days_back)  # 多留一些余量，(tyb)TODO 更精确的计算
-                    # 调整到最近的交易日
-                    start_date_date = get_nearest_trade_day(trade_days, start_date.date(), direction='forward')
-                    start_date = datetime.datetime.combine(start_date_date, datetime.time(9, 35))
+                    if count == 1:
+                        start_date = end_date
+                    else:
+                        # # 对于分钟线，我们需要估算大概的开始时间
+                        # # 每天约240个分钟（4小时），向前推count/240天
+                        days_back = max(1, count // 48 + 1)
+                        start_date = end_date - datetime.timedelta(days=days_back)  # 多留一些余量，(tyb)TODO 更精确的计算
+                        # 调整到最近的交易日
+                        start_date_date = get_nearest_trade_day(trade_days, start_date.date(), direction='forward')
+                        start_date = datetime.datetime.combine(start_date_date, datetime.time(9, 35))
                 else:
                     start_date = datetime.datetime(2015, 1, 1, 9, 35)
             elif isinstance(start_date, str):
