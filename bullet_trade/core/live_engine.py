@@ -547,6 +547,7 @@ class LiveEngine:
         if previous_trade_day is None:
             previous_trade_day = current_date - timedelta(days=1)
         self.context.previous_date = previous_trade_day
+        log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))
         log.info(f"📅 新交易日：{current_date}")
