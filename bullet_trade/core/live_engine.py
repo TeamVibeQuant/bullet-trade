@@ -479,13 +479,24 @@ class LiveEngine:
             provider = get_data_provider('jqdata')
             previous_days = provider.get_trade_days(end_date=current_date, count=2)  # [previous date, current date]
             for day in previous_days:
+                # 统一转换为 date 类型
+                if hasattr(day, 'date') and callable(day.date):
+                    # datetime, pandas Timestamp 等有 .date() 方法的类型
+                    log.debug(f"获取前一个交易日: {day} 类型 {type(day).__name__}，转换为 date")
+                    day = day.date()
+                elif isinstance(day, date):
+                    log.debug(f"获取前一个交易日: {day} 类型 date")
+                else:
+                    log.debug(f"获取前一个交易日: {day} 类型 {type(day)}")
+
                 if day != current_date:
-                    self.context.previous_date = day.date()
+                    self.context.previous_date = day
                     log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
                     break
         except Exception as exc:
             log.error(f"获取前一个交易日失败: {exc}")
             self.context.previous_date = self._previous_trade_day
+            log.info(f"📅 设置前一个交易日为 {self.context.previous_date}")
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))
         log.info(f"📅 新交易日：{current_date}")
