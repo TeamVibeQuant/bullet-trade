@@ -84,6 +84,7 @@ def order(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     按股数下单
@@ -123,10 +124,11 @@ def order(
         is_buy=(amount > 0),
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
-    
+
     _order_queue.append(order_obj)
-    log.debug(f"创建订单: {security}, 数量: {amount}, 价格: {price}")
+    log.debug(f"创建订单: {security}, 数量: {amount}, 价格: {price}, pindex: {pindex}")
     _trigger_order_processing(wait_timeout)
     
     return order_obj
@@ -187,6 +189,7 @@ def order_value(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     按价值下单
@@ -228,13 +231,14 @@ def order_value(
         is_buy=(value > 0),
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
-    
+
     # 存储目标价值，用于撮合时计算
     order_obj._target_value = abs(value)  # type: ignore
-    
+
     _order_queue.append(order_obj)
-    log.debug(f"创建订单（按价值）: {security}, 价值: {value}")
+    log.debug(f"创建订单（按价值）: {security}, 价值: {value}, pindex: {pindex}")
     _trigger_order_processing(wait_timeout)
     
     return order_obj
@@ -246,6 +250,7 @@ def order_target(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     目标股数下单（调整持仓到目标数量）
@@ -271,13 +276,14 @@ def order_target(
         is_buy=True,
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
 
     order_obj._is_target_amount = True  # type: ignore
     order_obj._target_amount = amount  # type: ignore
 
     _order_queue.append(order_obj)
-    log.debug(f"创建订单（目标股数）: {security}, 目标数量: {amount}")
+    log.debug(f"创建订单（目标股数）: {security}, 目标数量: {amount}, pindex: {pindex}")
     _trigger_order_processing(wait_timeout)
 
     return order_obj
@@ -289,6 +295,7 @@ def order_target_value(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     目标价值下单（调整持仓到目标价值）
@@ -314,13 +321,14 @@ def order_target_value(
         is_buy=True,
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
 
     order_obj._is_target_value = True  # type: ignore
     order_obj._target_value = value  # type: ignore
 
     _order_queue.append(order_obj)
-    log.debug(f"创建订单（目标价值）: {security}, 目标价值 {value}")
+    log.debug(f"创建订单（目标价值）: {security}, 目标价值 {value}, pindex: {pindex}")
     _trigger_order_processing(wait_timeout)
 
     return order_obj

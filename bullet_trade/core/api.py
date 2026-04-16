@@ -13,6 +13,7 @@ from .runtime import get_current_engine
 # 导入设置函数
 from .settings import (
     set_benchmark, set_order_cost, set_commission, set_universe, set_slippage, set_option,
+    set_subportfolios,
     OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 )
 
@@ -29,7 +30,7 @@ from .scheduler import (
 
 # 导入数据模型
 from .models import (
-    Context, Portfolio, SubPortfolio, Position,
+    Context, Portfolio, SubPortfolio, SubPortfolioConfig, Position,
     Trade, Order, OrderStatus, OrderStyle, SecurityUnitData
 )
 
@@ -423,6 +424,7 @@ __all__ = [
     
     # 设置函数
     'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
+    'set_subportfolios',
     'OrderCost', 'PerTrade', 'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     
     # 订单函数
@@ -433,7 +435,7 @@ __all__ = [
     'run_daily', 'run_weekly', 'run_monthly', 'unschedule_all',
     
     # 数据模型
-    'Context', 'Portfolio', 'SubPortfolio', 'Position',
+    'Context', 'Portfolio', 'SubPortfolio', 'SubPortfolioConfig', 'Position',
     'Trade', 'Order', 'OrderStatus', 'OrderStyle', 'SecurityUnitData',
     
     # 数据API

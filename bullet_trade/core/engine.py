@@ -1144,9 +1144,15 @@ class BacktestEngine:
 
     def _rollover_tplus_for_new_day(self) -> None:
         """在新交易日开始时释放 T+1 锁定的当日买入量。"""
-        if not self.context or not self.context.portfolio or not self.context.portfolio.positions:
+        if not self.context or not self.context.portfolio:
             return
-        for code, pos in list(self.context.portfolio.positions.items()):
+        # 遍历所有子账户的持仓
+        all_positions = {}
+        for sp in self.context.portfolio.subportfolios.values():
+            all_positions.update(sp.positions)
+        if not all_positions:
+            return
+        for code, pos in list(all_positions.items()):
             try:
                 info = get_security_info(code)
                 tplus = self._infer_tplus_from_info(info)
@@ -1483,6 +1489,13 @@ class BacktestEngine:
             log.debug(f"检查 {security} 停牌状态失败: {e}")
             return False  # 获取失败时不阻断处理
 
+    def _get_subportfolio(self, pindex: int = 0):
+        """根据 pindex 获取子账户，回退到顶层 portfolio"""
+        sp = self.context.portfolio.subportfolios.get(pindex)
+        if sp is not None:
+            return sp
+        return self.context.portfolio.subportfolios.get(0, None)
+
     def _process_orders(self, current_dt: datetime):
         """处理订单队列"""
         orders = get_order_queue()
@@ -1637,9 +1650,12 @@ class BacktestEngine:
                     close_tax_rate = 0.001
                     min_commission = 5.0
                 
+                # 根据 pindex 获取子账户（资金 & 持仓隔离）
+                sp = self._get_subportfolio(getattr(order, 'pindex', 0))
+
                 if is_buy:
                     # 买入：计算可下单量上限，考虑最小佣金与锁定资金
-                    available_for_buy = max(0.0, self.context.portfolio.available_cash - self.context.portfolio.locked_cash)
+                    available_for_buy = max(0.0, sp.available_cash - sp.locked_cash)
                     effective_cash = max(0.0, available_for_buy - min_commission)
                     denom = fund_check_price * (1.0 + open_comm_rate + open_tax_rate)
                     aval_amount = int(effective_cash // denom) if denom > 0 else 0
@@ -1652,7 +1668,7 @@ class BacktestEngine:
                         final_amount = aval_amount
                 else:
                     # 卖出：缩量为可卖出数量
-                    pos = self.context.portfolio.positions.get(order.security)
+                    pos = sp.positions.get(order.security)
                     if not pos or pos.closeable_amount <= 0:
                         log.warning(f"{order.security} 无可卖持仓")
                         order.status = OrderStatus.rejected
@@ -1660,7 +1676,7 @@ class BacktestEngine:
                     if final_amount > pos.closeable_amount:
                         log.info(f"{order.security} 可卖出不足，缩量为 {pos.closeable_amount}")
                         final_amount = pos.closeable_amount
-                
+
                 if is_buy:
                     # 买入：一手取整 + 最小申报量
                     final_amount = (final_amount // min_trade_size) * min_trade_size
@@ -1679,10 +1695,10 @@ class BacktestEngine:
                     else:
                         log.debug(f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出")
                         final_amount = final_amount
-                
+
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
-                
+
                 # 计算交易费用（含最小佣金）
                 if is_buy:
                     commission = max(trade_value * open_comm_rate, min_commission)
@@ -1690,28 +1706,28 @@ class BacktestEngine:
                 else:
                     commission = max(trade_value * close_comm_rate, min_commission)
                     tax = trade_value * close_tax_rate
-                # 金额类按“分”四舍五入
+                # 金额类按”分”四舍五入
                 commission = self._round_half_up(commission, 2)
                 tax = self._round_half_up(tax, 2)
                 total_cost = self._round_half_up(trade_value + commission + tax, 2)
-                
+
                 if is_buy:
                     # 委托时锁定资金（含费用）
-                    self.context.portfolio.locked_cash += total_cost
-                    if total_cost > (self.context.portfolio.available_cash):
+                    sp.locked_cash += total_cost
+                    if total_cost > sp.available_cash:
                         # 双重保障：若仍不足则拒绝并回滚锁定
-                        log.warning(f"{order.security} 资金不足: 需要 {total_cost:.2f}, 可用 {self.context.portfolio.available_cash:.2f}")
-                        self.context.portfolio.locked_cash -= total_cost
+                        log.warning(f"{order.security} 资金不足: 需要 {total_cost:.2f}, 可用 {sp.available_cash:.2f}")
+                        sp.locked_cash -= total_cost
                         order.status = OrderStatus.rejected
                         continue
                     # 扣除资金并释放锁定
-                    self.context.portfolio.available_cash -= total_cost
-                    self.context.portfolio.locked_cash -= total_cost
-                    
+                    sp.available_cash -= total_cost
+                    sp.locked_cash -= total_cost
+
                     # 更新持仓
-                    if order.security not in self.context.portfolio.positions:
-                        self.context.portfolio.positions[order.security] = Position(security=order.security)
-                    position = self.context.portfolio.positions[order.security]
+                    if order.security not in sp.positions:
+                        sp.positions[order.security] = Position(security=order.security)
+                    position = sp.positions[order.security]
                     position.update_position(trade_amount, trade_price)
                     # T+ 规则：若 tplus=1，将当日买入计入锁定，并从可卖数量中抵消同额增量
                     tplus = self._infer_tplus_from_info(info)
@@ -1723,14 +1739,14 @@ class BacktestEngine:
                     log.info(f"买入 {order.security}: {trade_amount} 股, 委托价 {fund_check_price:.{price_decimals}f}, 成交价 {trade_price:.{price_decimals}f}, 费用 {commission+tax:.2f}")
                 else:
                     # 卖出：检查并执行
-                    position = self.context.portfolio.positions[order.security]
+                    position = sp.positions[order.security]
                     # 增加资金（卖出释放资金，不需锁定）
-                    self.context.portfolio.available_cash += self._round_half_up((trade_value - commission - tax), 2)
-                    
+                    sp.available_cash += self._round_half_up((trade_value - commission - tax), 2)
+
                     # 更新持仓
                     position.update_position(-trade_amount, trade_price)
                     if position.total_amount == 0:
-                        del self.context.portfolio.positions[order.security]
+                        del sp.positions[order.security]
                     else:
                         position.update_price(current_price)
                     log.info(f"卖出 {order.security}: {trade_amount} 股, 成交价 {trade_price:.{price_decimals}f}, 费用 {commission+tax:.2f}")
@@ -1765,41 +1781,48 @@ class BacktestEngine:
     
     def _calculate_order_amount(self, order, current_price: float) -> int:
         """计算订单实际数量"""
+        sp = self._get_subportfolio(getattr(order, 'pindex', 0))
+        positions = sp.positions if sp else self.context.portfolio.positions
+
         # 普通订单
         if not hasattr(order, '_target_amount') and not hasattr(order, '_target_value') and not hasattr(order, '_is_target_amount') and not hasattr(order, '_is_target_value'):
             return order.amount if order.is_buy else -order.amount
-        
+
         # 目标数量订单
         if hasattr(order, '_is_target_amount') and order._is_target_amount:
             target = order._target_amount
             current = 0
-            if order.security in self.context.portfolio.positions:
-                current = self.context.portfolio.positions[order.security].total_amount
+            if order.security in positions:
+                current = positions[order.security].total_amount
             return target - current
-        
+
         # 目标价值订单
         if hasattr(order, '_is_target_value') and order._is_target_value:
             target_value = order._target_value
             current_value = 0
-            if order.security in self.context.portfolio.positions:
-                position = self.context.portfolio.positions[order.security]
+            if order.security in positions:
+                position = positions[order.security]
                 current_value = position.total_amount * current_price
-            
+
             diff_value = target_value - current_value
             return int(diff_value / current_price)
-        
+
         # 按价值订单
         if hasattr(order, '_target_value'):
             return int(order._target_value / current_price) if order.is_buy else -int(order._target_value / current_price)
-        
+
         return order.amount if order.is_buy else -order.amount
     
     def _update_positions(self):
         """更新持仓价格（使用收盘价）"""
-        if not self.context.portfolio.positions:
+        # 收集所有子账户中的证券代码
+        all_securities = set()
+        for sp in self.context.portfolio.subportfolios.values():
+            all_securities.update(sp.positions.keys())
+        if not all_securities:
             return
-        
-        securities = list(self.context.portfolio.positions.keys())
+
+        securities = list(all_securities)
         try:
             # 获取多个标的的收盘价
             # 返回的DataFrame: index=时间, columns=标的代码（如果只有一个字段）
@@ -1860,7 +1883,10 @@ class BacktestEngine:
                                 continue
                         
                         if pd.notna(close_price) and close_price > 0:
-                            self.context.portfolio.positions[security].update_price(float(close_price))
+                            # 更新所有子账户中该证券的价格
+                            for sp in self.context.portfolio.subportfolios.values():
+                                if security in sp.positions:
+                                    sp.positions[security].update_price(float(close_price))
                     except Exception as e:
                         log.debug(f"更新{security}价格失败: {e}")
         except Exception as e:

@@ -45,6 +45,7 @@ try:
         set_order_cost,
         set_commission,
         set_universe,
+        set_subportfolios,
         # 数据API
         get_price,
         get_live_current,
@@ -74,6 +75,7 @@ try:
         Context,
         Portfolio,
         SubPortfolio,
+        SubPortfolioConfig,
         Position,
         Order,
         Trade,
@@ -116,6 +118,7 @@ except Exception:  # pragma: no cover
         set_order_cost,
         set_commission,
         set_universe,
+        set_subportfolios,
         get_price,
         get_live_current,
         batch_get_live_current,
@@ -138,6 +141,7 @@ except Exception:  # pragma: no cover
         Context,
         Portfolio,
         SubPortfolio,
+        SubPortfolioConfig,
         Position,
         Order,
         Trade,
@@ -182,6 +186,7 @@ __all__ = [
 
     # 设置相关
     'set_benchmark', 'set_option', 'set_slippage', 'set_order_cost', 'set_commission', 'set_universe',
+    'set_subportfolios',
 
     # 数据API
     'get_price', 'attribute_history',
@@ -200,7 +205,7 @@ __all__ = [
     'subscribe', 'unsubscribe', 'unsubscribe_all', 'get_current_tick',
 
     # 数据模型
-    'Context', 'Portfolio', 'SubPortfolio', 'Position',
+    'Context', 'Portfolio', 'SubPortfolio', 'SubPortfolioConfig', 'Position',
     'Order', 'Trade', 'OrderStatus', 'OrderStyle',
     'SecurityUnitData',
 
