@@ -77,6 +77,8 @@ from .live_runtime import (
     start_g_autosave,
     stop_g_autosave,
     save_g,
+    register_portfolio,
+    load_subportfolios,
     load_scheduler_cursor,
     persist_scheduler_cursor,
     load_subscription_state,
@@ -351,6 +353,7 @@ class LiveEngine:
         reset_settings()
         set_current_engine(self)
         set_current_context(self.context)
+        register_portfolio(self._portfolio)
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
 
@@ -388,6 +391,11 @@ class LiveEngine:
         self._init_broker()
 
         await self._call_hook(self.process_initialize_func)
+
+        # 必须在 process_initialize 之后恢复子账户状态，因为
+        # process_initialize → initialize() → set_subportfolios 会重建子账户结构。
+        # 恢复逻辑：优先从 JSON 快照精确还原，回退按比例分配券商真实资金。
+        self._restore_subportfolios()
 
         self._dedupe_scheduler_tasks()
 
@@ -2056,6 +2064,97 @@ class LiveEngine:
     # 工具函数
     # ------------------------------------------------------------------
 
+    def _restore_subportfolios(self) -> None:
+        """券商连接后恢复子账户状态。
+
+        受策略选项 ``use_subportfolio_snapshot`` 控制（默认 True）。
+        策略可在 initialize() 中通过 set_option('use_subportfolio_snapshot', False) 关闭。
+
+        A) 快照存在 & 选项为 True（断点恢复）：
+           从 subportfolios.json 完整重建子账户结构，原样还原，不做任何修正。
+           快照是唯一真相源。
+
+        B) 快照不存在（首次启动）：
+           initialize() 已调用 set_subportfolios 创建结构，
+           用券商真实总资产 starting_cash 按比例缩放现金。
+        """
+        from .models import SubPortfolio, Position
+
+        settings = get_settings()
+        use_snapshot = settings.options.get('use_subportfolio_snapshot', True)
+
+        portfolio = self.context.portfolio
+        backing = getattr(portfolio, 'backing', portfolio)
+
+        snapshot = load_subportfolios()
+        if use_snapshot and snapshot and 'subportfolios' in snapshot:
+            saved_subs = snapshot['subportfolios']
+            if len(saved_subs) <= 1:
+                log.debug("子账户快照仅含 %d 个子账户，跳过恢复", len(saved_subs))
+                return
+            saved_at = snapshot.get('saved_at', '未知')
+            log.info("从快照恢复子账户状态 (saved_at=%s)", saved_at)
+
+            # 清除现有子账户，从 JSON 完整重建——快照即真相，不做任何修正
+            backing.subportfolios.clear()
+            for idx_str, saved in saved_subs.items():
+                idx = int(idx_str)
+                sp = SubPortfolio(
+                    type=saved.get('type', 'stock'),
+                    available_cash=float(saved['available_cash']),
+                    transferable_cash=float(saved.get('transferable_cash', saved['available_cash'])),
+                    locked_cash=float(saved.get('locked_cash', 0.0)),
+                    total_value=float(saved['total_value']),
+                )
+                for sec, pos_data in (saved.get('positions') or {}).items():
+                    sp.positions[sec] = Position(
+                        security=pos_data['security'],
+                        total_amount=int(pos_data['total_amount']),
+                        closeable_amount=int(pos_data.get('closeable_amount', pos_data['total_amount'])),
+                        avg_cost=float(pos_data.get('avg_cost', 0.0)),
+                        price=float(pos_data.get('price', 0.0)),
+                        acc_avg_cost=float(pos_data.get('acc_avg_cost', pos_data.get('avg_cost', 0.0))),
+                        value=float(pos_data.get('value', 0.0)),
+                        side=pos_data.get('side', 'long'),
+                    )
+                backing.subportfolios[idx] = sp
+                log.info(
+                    "  子账户[%s]: %d 只持仓, 现金 %.2f, 总值 %.2f",
+                    idx, len(sp.positions), sp.available_cash, sp.total_value,
+                )
+
+            backing.update_value()
+            return
+
+        # 回退：首次启动（无快照），按比例分配券商真实资金
+        subs = backing.subportfolios
+        if len(subs) <= 1:
+            return
+
+        old_total = sum(sp.total_value for sp in subs.values())
+        if old_total <= 0:
+            return
+
+        real_total = backing.starting_cash
+        if real_total <= 0 or abs(real_total - old_total) < 0.01:
+            return
+
+        log.info(
+            "首次启动，子账户按比例分配: 原始总额 %.2f → 券商实际 %.2f",
+            old_total, real_total,
+        )
+        for idx, sp in subs.items():
+            ratio = sp.total_value / old_total
+            old_cash = sp.total_value
+            new_cash = real_total * ratio
+            sp.available_cash = new_cash
+            sp.transferable_cash = new_cash
+            sp.total_value = new_cash
+            log.info(
+                "  子账户[%s]: %.2f → %.2f (%.0f%%)",
+                idx, old_cash, new_cash, ratio * 100,
+            )
+
     def _init_broker(self) -> None:
         self._ensure_broker_created()
         assert self.broker is not None
@@ -2725,17 +2824,34 @@ class LiveEngine:
                 target.positions[security] = position
                 if stock_subportfolio is not None:
                     stock_subportfolio.positions[security] = position
+
+            # 首次连接券商时，用券商真实总资产锚定 starting_cash。
+            # 必须在 update_value() 之前设置，因为 update_value 会用子账户
+            # 聚合值覆盖 total_value，导致 starting_cash 取到错误的值。
+            if not self._initial_nav_synced and total is not None and float(total) > 0:
+                target.starting_cash = float(total)
+                self._initial_nav_synced = True
+                log.info("券商首次同步，starting_cash = %.2f", target.starting_cash)
+
+            # 当只有单个默认子账户时，将券商快照同步到该子账户，
+            # 避免 update_value() 聚合时用旧的子账户值覆盖券商数据。
+            # 多子账户时不动——各子账户由策略自行管理。
+            if len(target.subportfolios) == 1:
+                sp = next(iter(target.subportfolios.values()))
+                if cash is not None:
+                    sp.available_cash = float(cash)
+                if transferable is not None:
+                    sp.transferable_cash = float(transferable)
+                elif cash is not None:
+                    sp.transferable_cash = float(cash)
+                if locked is not None:
+                    sp.locked_cash = float(locked)
+                sp.positions = dict(target.positions)
+
             target.update_value()
         except Exception as exc:
             log.debug(f"应用账户快照失败: {exc}")
             return
-
-        if not self._initial_nav_synced and getattr(target, "total_value", 0) > 0:
-            try:
-                target.starting_cash = float(target.total_value)
-                self._initial_nav_synced = True
-            except Exception:
-                pass
 
     def _safe_account_info(self) -> Dict[str, Any]:
         if not self.broker:
