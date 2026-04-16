@@ -28,6 +28,9 @@ _state_cache: Optional[Dict[str, Any]] = None
 _state_lock = threading.Lock()
 _restored_from_disk = False
 
+# 子账户持久化：由 LiveEngine 注册 portfolio 引用，save_g 时自动保存
+_portfolio_ref: Any = None
+
 
 def _g_path() -> str:
     assert _runtime_dir is not None
@@ -106,7 +109,7 @@ def init_live_runtime(runtime_dir: str) -> None:
 
 def save_g() -> None:
     """
-    立即保存 g 到 RUNTIME_DIR/g.pkl。
+    立即保存 g 到 RUNTIME_DIR/g.pkl，并附带保存子账户快照。
     """
     if _runtime_dir is None:
         return
@@ -115,10 +118,15 @@ def save_g() -> None:
         with open(tmp, 'wb') as f:
             pickle.dump(getattr(g, '_data', {}), f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, _g_path())
-        print(f'🛟 已保存 g 到 {_g_path()}')
+        log.info(f'🛟 已保存 g 到 {_g_path()}')
 
     except Exception as e:
-        print(f'🛟 保存 g 失败: {e}')
+        log.error(f'🛟 保存 g 失败: {e}')
+
+    # 附带保存子账户快照
+    try:
+        save_subportfolios()
+    except Exception:
         pass
 
 
@@ -199,6 +207,74 @@ def persist_subscription_state(symbols: Sequence[str], markets: Sequence[str]) -
         'markets': sorted({str(m) for m in markets}),
     }
     _write_state(state)
+
+
+def register_portfolio(portfolio: Any) -> None:
+    """注册 Portfolio 引用，使 save_g 自动附带保存子账户状态。"""
+    global _portfolio_ref
+    _portfolio_ref = portfolio
+
+
+def _subportfolios_path() -> str:
+    assert _runtime_dir is not None
+    return os.path.join(_runtime_dir, 'subportfolios.json')
+
+
+def save_subportfolios() -> None:
+    """将所有子账户的 positions + cash 序列化为 JSON。"""
+    if _runtime_dir is None or _portfolio_ref is None:
+        return
+    try:
+        # 穿透 LivePortfolioProxy
+        backing = getattr(_portfolio_ref, 'backing', _portfolio_ref)
+        subs = getattr(backing, 'subportfolios', None)
+        if not subs or len(subs) <= 1:
+            return
+
+        data: Dict[str, Any] = {'subportfolios': {}, 'saved_at': datetime.now().isoformat()}
+        for idx, sp in subs.items():
+            positions_data: Dict[str, Any] = {}
+            for sec, pos in sp.positions.items():
+                positions_data[sec] = {
+                    'security': pos.security,
+                    'total_amount': pos.total_amount,
+                    'closeable_amount': pos.closeable_amount,
+                    'avg_cost': pos.avg_cost,
+                    'price': pos.price,
+                    'acc_avg_cost': getattr(pos, 'acc_avg_cost', pos.avg_cost),
+                    'value': pos.value,
+                    'side': getattr(pos, 'side', 'long'),
+                }
+            data['subportfolios'][str(idx)] = {
+                'type': sp.type,
+                'available_cash': sp.available_cash,
+                'transferable_cash': sp.transferable_cash,
+                'locked_cash': sp.locked_cash,
+                'total_value': sp.total_value,
+                'positions': positions_data,
+            }
+
+        tmp = _subportfolios_path() + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, _subportfolios_path())
+        log.info(f'🛟 已保存子账户快照到 {_subportfolios_path()}')
+    except Exception as e:
+        log.error(f'🛟 保存子账户快照失败: {e}')
+
+
+def load_subportfolios() -> Optional[Dict[str, Any]]:
+    """读取 subportfolios.json，返回 raw dict 或 None。"""
+    if _runtime_dir is None:
+        return None
+    path = _subportfolios_path()
+    try:
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception as e:
+        log.warn(f'加载子账户快照失败: {e}')
+    return None
 
 
 def runtime_restored() -> bool:
