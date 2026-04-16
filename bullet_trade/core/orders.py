@@ -139,6 +139,7 @@ def order(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     按股数下单
@@ -182,6 +183,7 @@ def order(
         is_buy=(amount > 0),
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
     
@@ -265,6 +267,7 @@ def order_value(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     按价值下单
@@ -310,12 +313,13 @@ def order_value(
         is_buy=(value > 0),
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
     
     # 存储目标价值，用于撮合时计算
     order_obj._target_value = abs(value)  # type: ignore
-    
+
     _order_queue.append(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
@@ -333,6 +337,7 @@ def order_target(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     目标股数下单（调整持仓到目标数量）
@@ -368,6 +373,7 @@ def order_target(
         is_buy=True,
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
 
@@ -391,6 +397,7 @@ def order_target_value(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    pindex: int = 0,
 ) -> Optional[Order]:
     """
     目标价值下单（调整持仓到目标价值）
@@ -426,6 +433,7 @@ def order_target_value(
         is_buy=True,
         style=resolved_style,
         wait_timeout=wait_timeout,
+        pindex=pindex,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
 

@@ -6,7 +6,10 @@
 
 from dataclasses import dataclass
 from datetime import date as Date
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any, Iterable, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .models import SubPortfolioConfig
 
 
 @dataclass
@@ -312,6 +315,34 @@ def set_option(key: str, value: Any):
     _settings.options[key] = value
 
 
+def set_subportfolios(configs: 'List[SubPortfolioConfig]'):
+    """
+    设置子账户（兼容聚宽 set_subportfolios）。
+
+    在 initialize() 中调用，按 configs 列表顺序创建子账户，
+    pindex 从 0 开始递增。
+
+    Args:
+        configs: SubPortfolioConfig 列表，顺序即为 pindex
+    """
+    from .runtime import get_current_engine
+    from .models import SubPortfolio
+
+    engine = get_current_engine()
+    if engine is None:
+        raise RuntimeError("set_subportfolios 必须在策略运行期间调用（engine 未就绪）")
+
+    portfolio = engine.context.portfolio
+    portfolio.subportfolios.clear()
+    for i, cfg in enumerate(configs):
+        portfolio.subportfolios[i] = SubPortfolio(
+            type=cfg.type,
+            available_cash=cfg.cash,
+            transferable_cash=cfg.cash,
+            total_value=cfg.cash,
+        )
+
+
 def get_settings() -> StrategySettings:
     """获取设置实例"""
     return _settings
@@ -326,5 +357,6 @@ __all__ = [
     'OrderCost', 'PerTrade',
     'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
+    'set_subportfolios',
     'get_settings', 'reset_settings'
 ]

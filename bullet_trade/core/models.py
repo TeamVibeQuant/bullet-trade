@@ -251,6 +251,7 @@ class SubPortfolio:
     type: str = 'stock'  # stock/futures
     available_cash: float = 0.0
     transferable_cash: float = 0.0
+    locked_cash: float = 0.0
     total_value: float = 0.0
     positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
@@ -261,7 +262,19 @@ class SubPortfolio:
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
-        self.total_value = self.available_cash + self.positions_value
+        self.total_value = self.available_cash + self.positions_value + self.locked_cash
+
+
+@dataclass
+class SubPortfolioConfig:
+    """子账户配置（用于 set_subportfolios）
+
+    Attributes:
+        cash: 初始资金
+        type: 账户类型 ('stock' / 'futures')
+    """
+    cash: float
+    type: str = 'stock'
 
 
 @dataclass
@@ -286,7 +299,7 @@ class Portfolio:
     starting_cash: float = 100000.0
     positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
-    subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
+    subportfolios: Dict[int, SubPortfolio] = field(default_factory=dict)
     
     # 风险指标
     returns: float = 0.0  # 当日收益
@@ -296,7 +309,7 @@ class Portfolio:
         """初始化子账户"""
         self.positions = ensure_security_position_map(self.positions)
         if not self.subportfolios:
-            self.subportfolios['stock'] = SubPortfolio(
+            self.subportfolios[0] = SubPortfolio(
                 type='stock',
                 available_cash=self.available_cash,
                 transferable_cash=self.transferable_cash,
@@ -311,12 +324,26 @@ class Portfolio:
     
     def update_value(self):
         """更新账户总价值"""
-        self.positions_value = sum(pos.value for pos in self.positions.values())
-        self.total_value = self.available_cash + self.positions_value + self.locked_cash
-        
-        # 更新子账户
+        # 先更新子账户
         for subportfolio in self.subportfolios.values():
             subportfolio.update_value()
+
+        # 从子账户汇总到顶层 Portfolio
+        if self.subportfolios:
+            self.positions.clear()
+            self.available_cash = 0.0
+            self.locked_cash = 0.0
+            self.positions_value = 0.0
+            self.total_value = 0.0
+            for sp in self.subportfolios.values():
+                self.available_cash += sp.available_cash
+                self.locked_cash += sp.locked_cash
+                self.positions_value += sp.positions_value
+                self.total_value += sp.total_value
+                self.positions.update(sp.positions)
+        else:
+            self.positions_value = sum(pos.value for pos in self.positions.values())
+            self.total_value = self.available_cash + self.positions_value + self.locked_cash
 
 
 @dataclass
@@ -375,6 +402,7 @@ class Order:
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
     value: float = 0.0  # 订单总价值（仅供参考）
+    pindex: int = 0  # 子账户序号（0 起始）
 
 
 @dataclass
