@@ -865,7 +865,9 @@ def test_save_g_refreshes_subportfolio_prices_before_writing(tmp_path):
     engine.broker = DummyBroker()
     init_live_runtime(str(runtime_dir))
     register_portfolio(engine._portfolio)
-    register_portfolio_price_refresher(lambda: engine._refresh_subportfolio_prices(engine._portfolio))
+    register_portfolio_price_refresher(
+        lambda force_log=False: engine._refresh_subportfolio_prices(engine._portfolio, force_log=force_log)
+    )
 
     engine._portfolio.subportfolios.clear()
     engine._portfolio.subportfolios[0] = SubPortfolio(
