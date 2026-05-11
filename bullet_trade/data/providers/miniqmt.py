@@ -648,11 +648,11 @@ class MiniQMTProvider(DataProvider):
             except Exception:
                 pass
         
-        logger.debug(
-            f"QMT _fetch_local_data: 调用 xt.get_local_data(stock_list=[{security}], "
-            f"count={use_count_in_xt or -1}, period={period}, "
-            f"start_time={use_start_time}, end_time={end_time}, dividend_type={dividend_type})"
-        )
+        # logger.debug(
+        #     f"QMT _fetch_local_data: 调用 xt.get_local_data(stock_list=[{security}], "
+        #     f"count={use_count_in_xt or -1}, period={period}, "
+        #     f"start_time={use_start_time}, end_time={end_time}, dividend_type={dividend_type})"
+        # )
         try:
             data = xt.get_local_data(
                 stock_list=[security],
@@ -669,7 +669,7 @@ class MiniQMTProvider(DataProvider):
             )
             raise
         
-        logger.debug(f"QMT _fetch_local_data: xt.get_local_data 返回 data.keys()={list(data.keys()) if data else None}")
+        # logger.debug(f"QMT _fetch_local_data: xt.get_local_data 返回 data.keys()={list(data.keys()) if data else None}")
         
         df = data.get(security)
         if df is None or df.empty:
@@ -677,7 +677,7 @@ class MiniQMTProvider(DataProvider):
             return pd.DataFrame()
         
         df = df.copy()
-        logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
+        # logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
         
         # xtquant 时间戳为毫秒级 UTC，需要转换到沪深时区（Asia/Shanghai）再处理
         if "time" not in df.columns:
