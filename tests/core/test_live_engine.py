@@ -5,6 +5,7 @@ LiveEngine 核心行为测试。
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 from datetime import date, datetime, timedelta, time as Time
 from pathlib import Path
@@ -17,9 +18,10 @@ from bullet_trade.core import pricing
 from bullet_trade.core.async_scheduler import AsyncScheduler
 from bullet_trade.core.event_bus import EventBus
 from bullet_trade.core.live_engine import LiveEngine, LivePortfolioProxy, TradingCalendarGuard
-from bullet_trade.core.live_runtime import load_subscription_state, save_g
+from bullet_trade.core.live_runtime import init_live_runtime, load_subscription_state, register_portfolio, save_g
 from bullet_trade.core.globals import g, reset_globals
-from bullet_trade.core.orders import order, clear_order_queue
+from bullet_trade.core.models import SubPortfolio
+from bullet_trade.core.orders import order, order_target_value, clear_order_queue
 from bullet_trade.core.runtime import set_current_engine
 
 
@@ -663,6 +665,84 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
     sec2, amt2, price2, side2, market2 = engine.broker.orders[1]
     assert (sec2, amt2, side2, market2) == ("000001.XSHE", 100, "buy", False)
     assert price2 == pytest.approx(10.5)
+
+
+@pytest.mark.asyncio
+async def test_live_order_updates_virtual_subportfolio_by_pindex(monkeypatch, tmp_path):
+    strategy = _write_strategy(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    cfg = {
+        "runtime_dir": str(runtime_dir),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    engine.broker = DummyBroker()
+    engine._risk = None
+    init_live_runtime(str(runtime_dir))
+    register_portfolio(engine._portfolio)
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(
+        type="stock",
+        available_cash=6000.0,
+        transferable_cash=6000.0,
+        total_value=6000.0,
+    )
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=4000.0,
+        transferable_cash=4000.0,
+        total_value=4000.0,
+    )
+    engine._portfolio.update_value()
+
+    class Snap:
+        paused = False
+        last_price = 10.0
+        high_limit = 10.5
+        low_limit = 9.5
+
+    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+
+    clear_order_queue()
+    set_current_engine(None)
+    order_target_value("000001.XSHE", 2000.0, pindex=1)
+    await engine._process_orders(engine.context.current_dt)
+
+    assert "000001.XSHE" not in engine._portfolio.subportfolios[0].positions
+    pos = engine._portfolio.subportfolios[1].positions["000001.XSHE"]
+    assert pos.total_amount == 200
+    buy_price = pricing.compute_market_protect_price("000001.XSHE", 10.0, 10.5, 9.5, 0.015, True)
+    assert engine._portfolio.subportfolios[1].available_cash == pytest.approx(4000.0 - 200 * buy_price)
+    assert engine.context.subportfolios[1].positions["000001.XSHE"].total_amount == 200
+
+    clear_order_queue()
+    order_target_value("000001.XSHE", 1000.0, pindex=0)
+    await engine._process_orders(engine.context.current_dt)
+
+    assert engine.context.subportfolios[0].positions["000001.XSHE"].total_amount == 100
+    assert engine.context.subportfolios[1].positions["000001.XSHE"].total_amount == 200
+
+    snapshot_path = runtime_dir / "subportfolios.json"
+    assert snapshot_path.exists()
+    snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["total_amount"] == 100
+    assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["total_amount"] == 200
+
+    clear_order_queue()
+    order_target_value("000001.XSHE", 0.0, pindex=1)
+    await engine._process_orders(engine.context.current_dt)
+
+    assert "000001.XSHE" in engine._portfolio.subportfolios[0].positions
+    assert "000001.XSHE" not in engine._portfolio.subportfolios[1].positions
 
 
 @pytest.mark.asyncio
