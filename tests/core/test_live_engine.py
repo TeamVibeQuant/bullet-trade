@@ -18,9 +18,15 @@ from bullet_trade.core import pricing
 from bullet_trade.core.async_scheduler import AsyncScheduler
 from bullet_trade.core.event_bus import EventBus
 from bullet_trade.core.live_engine import LiveEngine, LivePortfolioProxy, TradingCalendarGuard
-from bullet_trade.core.live_runtime import init_live_runtime, load_subscription_state, register_portfolio, save_g
+from bullet_trade.core.live_runtime import (
+    init_live_runtime,
+    load_subscription_state,
+    register_portfolio,
+    register_portfolio_price_refresher,
+    save_g,
+)
 from bullet_trade.core.globals import g, reset_globals
-from bullet_trade.core.models import SubPortfolio
+from bullet_trade.core.models import Position, SubPortfolio
 from bullet_trade.core.orders import order, order_target_value, clear_order_queue
 from bullet_trade.core.runtime import set_current_engine
 
@@ -743,6 +749,159 @@ async def test_live_order_updates_virtual_subportfolio_by_pindex(monkeypatch, tm
 
     assert "000001.XSHE" in engine._portfolio.subportfolios[0].positions
     assert "000001.XSHE" not in engine._portfolio.subportfolios[1].positions
+
+
+@pytest.mark.asyncio
+async def test_restore_subportfolios_refreshes_prices_from_broker_snapshot(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    snapshot_path = runtime_dir / "subportfolios.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2025-01-02T09:30:00",
+                "subportfolios": {
+                    "0": {
+                        "type": "stock",
+                        "available_cash": 1000.0,
+                        "transferable_cash": 1000.0,
+                        "locked_cash": 0.0,
+                        "total_value": 1200.0,
+                        "positions": {
+                            "000001.XSHE": {
+                                "security": "000001.XSHE",
+                                "total_amount": 40,
+                                "closeable_amount": 40,
+                                "avg_cost": 9.0,
+                                "price": 5.0,
+                                "acc_avg_cost": 9.0,
+                                "value": 200.0,
+                                "side": "long",
+                            }
+                        },
+                    },
+                    "1": {
+                        "type": "stock",
+                        "available_cash": 2000.0,
+                        "transferable_cash": 2000.0,
+                        "locked_cash": 0.0,
+                        "total_value": 2360.0,
+                        "positions": {
+                            "000001.XSHE": {
+                                "security": "000001.XSHE",
+                                "total_amount": 60,
+                                "closeable_amount": 60,
+                                "avg_cost": 9.5,
+                                "price": 6.0,
+                                "acc_avg_cost": 9.5,
+                                "value": 360.0,
+                                "side": "long",
+                            }
+                        },
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(runtime_dir),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine.broker = DummyBroker()
+    init_live_runtime(str(runtime_dir))
+    register_portfolio(engine._portfolio)
+
+    engine._restore_subportfolios()
+
+    pos0 = engine.context.subportfolios[0].positions["000001.XSHE"]
+    pos1 = engine.context.subportfolios[1].positions["000001.XSHE"]
+    assert pos0.price == pytest.approx(11.0)
+    assert pos0.value == pytest.approx(440.0)
+    assert pos1.price == pytest.approx(11.0)
+    assert pos1.value == pytest.approx(660.0)
+    assert engine.context.subportfolios[0].total_value == pytest.approx(1440.0)
+    assert engine.context.subportfolios[1].total_value == pytest.approx(2660.0)
+
+    refreshed_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    assert refreshed_snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
+    assert refreshed_snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["value"] == pytest.approx(660.0)
+
+
+def test_save_g_refreshes_subportfolio_prices_before_writing(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(runtime_dir),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine.broker = DummyBroker()
+    init_live_runtime(str(runtime_dir))
+    register_portfolio(engine._portfolio)
+    register_portfolio_price_refresher(lambda: engine._refresh_subportfolio_prices(engine._portfolio))
+
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(
+        type="stock",
+        available_cash=1000.0,
+        transferable_cash=1000.0,
+        total_value=1200.0,
+        positions={
+            "000001.XSHE": Position(
+                security="000001.XSHE",
+                total_amount=20,
+                closeable_amount=20,
+                avg_cost=9.0,
+                price=5.0,
+                value=100.0,
+            )
+        },
+    )
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=2000.0,
+        transferable_cash=2000.0,
+        total_value=2300.0,
+        positions={
+            "000001.XSHE": Position(
+                security="000001.XSHE",
+                total_amount=30,
+                closeable_amount=30,
+                avg_cost=9.5,
+                price=6.0,
+                value=180.0,
+            )
+        },
+    )
+
+    save_g()
+
+    snapshot = json.loads((runtime_dir / "subportfolios.json").read_text(encoding="utf-8"))
+    assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
+    assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["value"] == pytest.approx(220.0)
+    assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
+    assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["value"] == pytest.approx(330.0)
 
 
 @pytest.mark.asyncio
