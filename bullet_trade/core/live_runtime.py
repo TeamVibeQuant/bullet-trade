@@ -16,7 +16,7 @@ import pickle
 import threading
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .globals import g, log
 
@@ -30,6 +30,7 @@ _restored_from_disk = False
 
 # 子账户持久化：由 LiveEngine 注册 portfolio 引用，save_g 时自动保存
 _portfolio_ref: Any = None
+_portfolio_price_refresher: Optional[Callable[[], bool]] = None
 
 
 def _g_path() -> str:
@@ -81,13 +82,14 @@ def init_live_runtime(runtime_dir: str) -> None:
     """
     初始化 live 运行态：创建目录并尝试加载 g，同时准备扩展状态。
     """
-    global _runtime_dir, _restored_from_disk
+    global _runtime_dir, _restored_from_disk, _portfolio_price_refresher
     _runtime_dir = os.path.abspath(os.path.expanduser(runtime_dir))
     os.makedirs(_runtime_dir, exist_ok=True)
     # 重置状态缓存
     global _state_cache
     _state_cache = None
     _restored_from_disk = False
+    _portfolio_price_refresher = None
     # 加载 g
     try:
         path = _g_path()
@@ -215,6 +217,12 @@ def register_portfolio(portfolio: Any) -> None:
     _portfolio_ref = portfolio
 
 
+def register_portfolio_price_refresher(refresher: Optional[Callable[[], bool]]) -> None:
+    """注册保存子账户前的价格刷新回调。"""
+    global _portfolio_price_refresher
+    _portfolio_price_refresher = refresher
+
+
 def _subportfolios_path() -> str:
     assert _runtime_dir is not None
     return os.path.join(_runtime_dir, 'subportfolios.json')
@@ -230,6 +238,12 @@ def save_subportfolios() -> None:
         subs = getattr(backing, 'subportfolios', None)
         if not subs or len(subs) <= 1:
             return
+
+        if _portfolio_price_refresher is not None:
+            try:
+                _portfolio_price_refresher()
+            except Exception as exc:
+                log.debug(f'🛟 保存子账户快照前刷新价格失败: {exc}')
 
         data: Dict[str, Any] = {'subportfolios': {}, 'saved_at': datetime.now().isoformat()}
         for idx, sp in subs.items():

@@ -78,6 +78,7 @@ from .live_runtime import (
     stop_g_autosave,
     save_g,
     register_portfolio,
+    register_portfolio_price_refresher,
     load_subportfolios,
     load_scheduler_cursor,
     persist_scheduler_cursor,
@@ -355,6 +356,7 @@ class LiveEngine:
         set_current_engine(self)
         set_current_context(self.context)
         register_portfolio(self._portfolio)
+        register_portfolio_price_refresher(lambda: self._refresh_subportfolio_prices(self._portfolio))
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
 
@@ -2201,8 +2203,8 @@ class LiveEngine:
         策略可在 initialize() 中通过 set_option('use_subportfolio_snapshot', False) 关闭。
 
         A) 快照存在 & 选项为 True（断点恢复）：
-           从 subportfolios.json 完整重建子账户结构，原样还原，不做任何修正。
-           快照是唯一真相源。
+           从 subportfolios.json 完整重建子账户结构，保留虚拟子账户归属与数量。
+           恢复后会尽量用券商/行情实时价格刷新持仓价格与市值。
 
         B) 快照不存在（首次启动）：
            initialize() 已调用 set_subportfolios 创建结构，
@@ -2225,7 +2227,7 @@ class LiveEngine:
             saved_at = snapshot.get('saved_at', '未知')
             log.info("从快照恢复子账户状态 (saved_at=%s)", saved_at)
 
-            # 清除现有子账户，从 JSON 完整重建——快照即真相，不做任何修正
+            # 清除现有子账户，从 JSON 完整重建；随后只刷新价格/市值，不改变归属与数量。
             backing.subportfolios.clear()
             for idx_str, saved in saved_subs.items():
                 idx = int(idx_str)
@@ -2253,7 +2255,13 @@ class LiveEngine:
                     idx, len(sp.positions), sp.available_cash, sp.total_value,
                 )
 
+            refreshed = self._refresh_subportfolio_prices(backing)
             backing.update_value()
+            if refreshed:
+                try:
+                    save_g()
+                except Exception as exc:
+                    log.debug(f"恢复子账户后保存刷新价格失败: {exc}")
             return
 
         # 回退：首次启动（无快照），按比例分配券商真实资金
@@ -2284,6 +2292,65 @@ class LiveEngine:
                 "  子账户[%s]: %.2f → %.2f (%.0f%%)",
                 idx, old_cash, new_cash, ratio * 100,
             )
+
+    def _refresh_subportfolio_prices(self, backing: Portfolio) -> bool:
+        """Refresh virtual positions with live prices without changing ownership."""
+        price_map: Dict[str, float] = {}
+
+        try:
+            snapshot = self.broker.sync_account() if self.broker and self.broker.supports_account_sync() else None
+        except Exception as exc:
+            log.debug(f"刷新子账户价格时获取券商价格失败: {exc}")
+            snapshot = None
+
+        for item in (snapshot or {}).get("positions") or []:
+            security = item.get("security")
+            if not security:
+                continue
+            price = self._to_float(item.get("current_price", item.get("price")), default=0.0)
+            if price <= 0:
+                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+                market_value = self._to_float(item.get("market_value"), default=0.0)
+                if amount > 0 and market_value > 0:
+                    price = market_value / amount
+            if price > 0:
+                price_map[security] = price
+
+        securities: Set[str] = set()
+        for sp in (getattr(backing, "subportfolios", {}) or {}).values():
+            securities.update((getattr(sp, "positions", {}) or {}).keys())
+
+        for security in securities:
+            if security in price_map:
+                continue
+            tick = self._fetch_tick_snapshot(security)
+            if not tick:
+                continue
+            price = self._to_float(
+                tick.get("last_price")
+                or tick.get("lastPrice")
+                or tick.get("price")
+                or tick.get("last"),
+                default=0.0,
+            )
+            if price > 0:
+                price_map[security] = price
+
+        if not price_map:
+            return False
+
+        refreshed = 0
+        for sp in (getattr(backing, "subportfolios", {}) or {}).values():
+            for security, pos in (getattr(sp, "positions", {}) or {}).items():
+                price = price_map.get(security)
+                if price is None or price <= 0:
+                    continue
+                pos.update_price(price)
+                refreshed += 1
+
+        if refreshed:
+            log.info("刷新子账户持仓实时价格: %d 条", refreshed)
+        return refreshed > 0
 
     def _init_broker(self) -> None:
         self._ensure_broker_created()
