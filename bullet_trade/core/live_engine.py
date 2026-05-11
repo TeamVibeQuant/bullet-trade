@@ -243,6 +243,7 @@ class LiveEngine:
         self._trades: Dict[str, Trade] = {}
         self._broker_order_index: Dict[str, str] = {}
         self._order_snapshot_debug_signatures: Dict[str, Tuple[Any, ...]] = {}
+        self._last_subportfolio_refresh_log: Optional[datetime] = None
         self._calendar_guard = TradingCalendarGuard(self.config)
         self._initial_nav_synced: bool = False
         self._provider_tick_callback_bound: bool = False
@@ -356,7 +357,9 @@ class LiveEngine:
         set_current_engine(self)
         set_current_context(self.context)
         register_portfolio(self._portfolio)
-        register_portfolio_price_refresher(lambda: self._refresh_subportfolio_prices(self._portfolio))
+        register_portfolio_price_refresher(
+            lambda force_log=False: self._refresh_subportfolio_prices(self._portfolio, force_log=force_log)
+        )
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
 
@@ -2297,6 +2300,7 @@ class LiveEngine:
         self,
         backing: Portfolio,
         snapshot: Optional[Dict[str, Any]] = None,
+        force_log: bool = False,
     ) -> bool:
         """Refresh virtual positions with live broker cost/price without changing ownership."""
         price_map: Dict[str, float] = {}
@@ -2346,6 +2350,9 @@ class LiveEngine:
                 price_map[security] = price
 
         if not price_map and not avg_cost_map:
+            if force_log:
+                log.info("刷新子账户持仓成本价/实时价格: %d 条", 0)
+                self._last_subportfolio_refresh_log = datetime.now()
             return False
 
         refreshed = 0
@@ -2364,8 +2371,12 @@ class LiveEngine:
                 if changed:
                     refreshed += 1
 
-        if refreshed:
-            log.info("刷新子账户持仓成本价/实时价格: %d 条", refreshed)
+        if refreshed or force_log:
+            now = datetime.now()
+            last_log = self._last_subportfolio_refresh_log
+            if force_log or last_log is None or (now - last_log).total_seconds() >= 300:
+                log.info("刷新子账户持仓成本价/实时价格: %d 条", refreshed)
+                self._last_subportfolio_refresh_log = now
         return refreshed > 0
 
     def _init_broker(self) -> None:

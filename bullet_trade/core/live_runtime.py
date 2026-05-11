@@ -30,7 +30,7 @@ _restored_from_disk = False
 
 # 子账户持久化：由 LiveEngine 注册 portfolio 引用，save_g 时自动保存
 _portfolio_ref: Any = None
-_portfolio_price_refresher: Optional[Callable[[], bool]] = None
+_portfolio_price_refresher: Optional[Callable[..., bool]] = None
 
 
 def _g_path() -> str:
@@ -217,7 +217,7 @@ def register_portfolio(portfolio: Any) -> None:
     _portfolio_ref = portfolio
 
 
-def register_portfolio_price_refresher(refresher: Optional[Callable[[], bool]]) -> None:
+def register_portfolio_price_refresher(refresher: Optional[Callable[..., bool]]) -> None:
     """注册保存子账户前的价格刷新回调。"""
     global _portfolio_price_refresher
     _portfolio_price_refresher = refresher
@@ -241,7 +241,12 @@ def save_subportfolios() -> None:
 
         if _portfolio_price_refresher is not None:
             try:
-                _portfolio_price_refresher()
+                _portfolio_price_refresher(True)
+            except TypeError:
+                try:
+                    _portfolio_price_refresher()
+                except Exception as exc:
+                    log.debug(f'🛟 保存子账户快照前刷新价格失败: {exc}')
             except Exception as exc:
                 log.debug(f'🛟 保存子账户快照前刷新价格失败: {exc}')
 
