@@ -165,6 +165,7 @@ class _ResolvedOrder:
     is_buy: bool
     price: Optional[float]
     last_price: float
+    pindex: int
     wait_timeout: Optional[float]
     is_market: bool
 
@@ -698,6 +699,7 @@ class LiveEngine:
             open_position_symbols = self._get_open_position_symbols()
             pending_new_positions: Set[str] = set()
             submitted_buys: Dict[str, Dict[str, Any]] = {}
+            subportfolio_dirty = False
             for order in orders:
                 self._register_order(order)
                 plan = self._build_order_plan(order, current_data)
@@ -810,6 +812,9 @@ class LiveEngine:
                         style=style_name,
                         order_remark=remark,
                     )
+                    if self._apply_virtual_order_fill(order, plan, {"status": getattr(order, "status", None)}):
+                        subportfolio_dirty = True
+
                     if risk:
                         try:
                             risk.record_trade(order_value, action=action)
@@ -862,6 +867,11 @@ class LiveEngine:
             except Exception as exc:
                 log.debug(f"订单执行后修正持仓成本失败: {exc}")
             self._trace_submitted_buys("post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots)
+            if subportfolio_dirty:
+                try:
+                    save_g()
+                except Exception as exc:
+                    log.debug(f"订单执行后保存运行态失败: {exc}")
 
     def _register_order(self, order: Order) -> None:
         if not order:
@@ -1676,9 +1686,10 @@ class LiveEngine:
             log.debug(f"{order.security} 无需交易或数量不足，跳过")
             return None
 
+        pindex = self._get_order_pindex(order)
         closeable = None
         if not is_buy:
-            closeable = self._get_closeable_amount(order.security)
+            closeable = self._get_closeable_amount(order.security, pindex=pindex)
             if closeable <= 0:
                 log.warning(f"{order.security} 当前无可卖数量，忽略订单")
                 return None
@@ -1728,6 +1739,7 @@ class LiveEngine:
             is_buy,
             exec_price,
             last_price,
+            pindex,
             getattr(order, "wait_timeout", None),
             is_market,
         )
@@ -1736,13 +1748,13 @@ class LiveEngine:
         price = last_price if last_price > 0 else 1.0
         if getattr(order, "_is_target_amount", False):
             target = int(getattr(order, "_target_amount", 0))
-            current = self._get_position_amount(order.security)
+            current = self._get_position_amount(order.security, pindex=self._get_order_pindex(order))
             delta = target - current
             return abs(delta), delta > 0
 
         if getattr(order, "_is_target_value", False):
             target_value = float(getattr(order, "_target_value", 0.0))
-            current_amount = self._get_position_amount(order.security)
+            current_amount = self._get_position_amount(order.security, pindex=self._get_order_pindex(order))
             target_amount = self._amount_from_value(target_value, price)
             delta_amount = target_amount - current_amount
             return abs(delta_amount), delta_amount > 0
@@ -1755,6 +1767,26 @@ class LiveEngine:
         amount = int(order.amount or 0)
         return abs(amount), bool(order.is_buy)
 
+    def _get_order_pindex(self, order: Order) -> int:
+        try:
+            return int(getattr(order, "pindex", 0) or 0)
+        except Exception:
+            return 0
+
+    def _portfolio_backing(self) -> Portfolio:
+        if isinstance(self.context.portfolio, LivePortfolioProxy):
+            return self.portfolio_proxy.backing
+        return self.context.portfolio
+
+    def _get_subportfolio(self, pindex: int):
+        backing = self._portfolio_backing()
+        subs = getattr(backing, "subportfolios", {}) or {}
+        if pindex in subs:
+            return subs[pindex]
+        if pindex == 0:
+            return subs.get(0)
+        return None
+
     def _resolve_price_percent(self, style: object, is_buy: bool) -> float:
         return pricing.resolve_market_percent(
             style,
@@ -1763,12 +1795,21 @@ class LiveEngine:
             self.config.sell_price_percent,
         )
 
-    def _get_position_amount(self, security: str) -> int:
-        pos = self.context.portfolio.positions.get(security)
+    def _get_position_amount(self, security: str, pindex: int = 0) -> int:
+        sp = self._get_subportfolio(pindex)
+        positions = sp.positions if sp is not None else self._portfolio_backing().positions
+        pos = positions.get(security)
         return int(pos.total_amount) if pos else 0
 
     def _get_open_position_symbols(self) -> Set[str]:
-        positions = getattr(self.context.portfolio, "positions", {}) or {}
+        backing = self._portfolio_backing()
+        positions: Dict[str, Position] = {}
+        subs = getattr(backing, "subportfolios", {}) or {}
+        if subs:
+            for sp in subs.values():
+                positions.update(getattr(sp, "positions", {}) or {})
+        else:
+            positions = getattr(backing, "positions", {}) or {}
         result: Set[str] = set()
         for sec, pos in positions.items():
             try:
@@ -1779,11 +1820,100 @@ class LiveEngine:
                 result.add(sec)
         return result
 
-    def _get_closeable_amount(self, security: str) -> int:
-        pos = self.context.portfolio.positions.get(security)
+    def _get_closeable_amount(self, security: str, pindex: int = 0) -> int:
+        sp = self._get_subportfolio(pindex)
+        positions = sp.positions if sp is not None else self._portfolio_backing().positions
+        pos = positions.get(security)
         if not pos:
             return 0
         return int(pos.closeable_amount or pos.total_amount or 0)
+
+    def _apply_virtual_order_fill(
+        self,
+        order: Order,
+        plan: _ResolvedOrder,
+        status_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Update the strategy-side subportfolio ledger after a live order is accepted.
+
+        Real brokers expose one physical account, while strategies may use multiple
+        virtual subportfolios. The broker snapshot cannot tell which pindex owns a
+        position, so this ledger must be maintained from the order's pindex.
+        """
+        status_snapshot = status_snapshot or {}
+        raw_status = status_snapshot.get("status", getattr(order, "status", None))
+        if isinstance(raw_status, OrderStatus):
+            status = raw_status.value
+        else:
+            status = str(raw_status or "").lower()
+        if status in {"rejected", "canceled", "cancelled"}:
+            log.info("跳过虚拟子账户更新: %s 状态=%s", plan.security, status)
+            return False
+
+        sp = self._get_subportfolio(plan.pindex)
+        if sp is None:
+            log.warning("无法更新虚拟子账户: pindex=%s 不存在", plan.pindex)
+            return False
+
+        amount = int(
+            status_snapshot.get("filled_amount")
+            or status_snapshot.get("traded_volume")
+            or status_snapshot.get("trade_volume")
+            or status_snapshot.get("filled_volume")
+            or plan.amount
+        )
+        if amount <= 0:
+            return False
+
+        fill_price = self._to_float(
+            status_snapshot.get("filled_price")
+            or status_snapshot.get("trade_price")
+            or status_snapshot.get("price")
+            or plan.price
+            or plan.last_price,
+            default=plan.last_price,
+        )
+        if fill_price <= 0:
+            fill_price = plan.last_price
+
+        if plan.is_buy:
+            position = sp.positions.get(plan.security)
+            if position is None:
+                position = Position(security=plan.security)
+                sp.positions[plan.security] = position
+            position.update_position(amount, fill_price)
+            position.update_price(plan.last_price or fill_price)
+            sp.available_cash = max(0.0, float(sp.available_cash or 0.0) - amount * fill_price)
+            sp.transferable_cash = min(float(sp.transferable_cash or 0.0), sp.available_cash)
+            action = "买入"
+        else:
+            position = sp.positions.get(plan.security)
+            if position is None:
+                return False
+            sell_amount = min(amount, int(position.total_amount or 0))
+            if sell_amount <= 0:
+                return False
+            position.update_position(-sell_amount, fill_price)
+            sp.available_cash = float(sp.available_cash or 0.0) + sell_amount * fill_price
+            sp.transferable_cash = float(sp.transferable_cash or 0.0) + sell_amount * fill_price
+            if position.total_amount <= 0:
+                sp.positions.pop(plan.security, None)
+            else:
+                position.update_price(plan.last_price or fill_price)
+            action = "卖出"
+
+        backing = self._portfolio_backing()
+        sp.update_value()
+        backing.update_value()
+        log.info(
+            "虚拟子账户[%s]已更新: %s %s %d股 @ %.4f",
+            plan.pindex,
+            action,
+            plan.security,
+            amount,
+            fill_price,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # 券商管理
