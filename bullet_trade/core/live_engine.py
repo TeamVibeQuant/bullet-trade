@@ -1312,10 +1312,13 @@ class LiveEngine:
                     total_value=float(saved['total_value']),
                 )
                 for sec, pos_data in (saved.get('positions') or {}).items():
+                    total_amount = int(pos_data.get('total_amount', 0) or 0)
+                    if total_amount <= 0:
+                        continue
                     sp.positions[sec] = Position(
                         security=pos_data['security'],
-                        total_amount=int(pos_data['total_amount']),
-                        closeable_amount=int(pos_data.get('closeable_amount', pos_data['total_amount'])),
+                        total_amount=total_amount,
+                        closeable_amount=int(pos_data.get('closeable_amount', total_amount)),
                         avg_cost=float(pos_data.get('avg_cost', 0.0)),
                         price=float(pos_data.get('price', 0.0)),
                         acc_avg_cost=float(pos_data.get('acc_avg_cost', pos_data.get('avg_cost', 0.0))),
@@ -1901,6 +1904,8 @@ class LiveEngine:
                 if not security:
                     continue
                 amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
+                if amount <= 0:
+                    continue
                 price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
                 target.positions[security] = Position(
                     security=security,

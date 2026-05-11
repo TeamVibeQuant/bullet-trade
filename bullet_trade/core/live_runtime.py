@@ -254,9 +254,15 @@ def save_subportfolios() -> None:
         for idx, sp in subs.items():
             positions_data: Dict[str, Any] = {}
             for sec, pos in sp.positions.items():
+                try:
+                    total_amount = int(getattr(pos, 'total_amount', 0) or 0)
+                except Exception:
+                    total_amount = 0
+                if total_amount <= 0:
+                    continue
                 positions_data[sec] = {
                     'security': pos.security,
-                    'total_amount': pos.total_amount,
+                    'total_amount': total_amount,
                     'closeable_amount': pos.closeable_amount,
                     'avg_cost': pos.avg_cost,
                     'price': pos.price,
