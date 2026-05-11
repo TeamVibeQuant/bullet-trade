@@ -1363,20 +1363,29 @@ class LiveEngine:
                 idx, old_cash, new_cash, ratio * 100,
             )
 
-    def _refresh_subportfolio_prices(self, backing: Portfolio) -> bool:
-        """Refresh virtual positions with live prices without changing ownership."""
+    def _refresh_subportfolio_prices(
+        self,
+        backing: Portfolio,
+        snapshot: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Refresh virtual positions with live broker cost/price without changing ownership."""
         price_map: Dict[str, float] = {}
+        avg_cost_map: Dict[str, float] = {}
 
-        try:
-            snapshot = self.broker.sync_account() if self.broker and self.broker.supports_account_sync() else None
-        except Exception as exc:
-            log.debug(f"刷新子账户价格时获取券商价格失败: {exc}")
-            snapshot = None
+        if snapshot is None:
+            try:
+                snapshot = self.broker.sync_account() if self.broker and self.broker.supports_account_sync() else None
+            except Exception as exc:
+                log.debug(f"刷新子账户持仓信息时获取券商快照失败: {exc}")
+                snapshot = None
 
         for item in (snapshot or {}).get("positions") or []:
             security = item.get("security")
             if not security:
                 continue
+            avg_cost = self._to_float(item.get("avg_cost"), default=0.0)
+            if avg_cost > 0:
+                avg_cost_map[security] = avg_cost
             price = self._to_float(item.get("current_price", item.get("price")), default=0.0)
             if price <= 0:
                 amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
@@ -1406,20 +1415,27 @@ class LiveEngine:
             if price > 0:
                 price_map[security] = price
 
-        if not price_map:
+        if not price_map and not avg_cost_map:
             return False
 
         refreshed = 0
         for sp in (getattr(backing, "subportfolios", {}) or {}).values():
             for security, pos in (getattr(sp, "positions", {}) or {}).items():
+                changed = False
+                avg_cost = avg_cost_map.get(security)
+                if avg_cost is not None and avg_cost > 0:
+                    pos.avg_cost = avg_cost
+                    pos.acc_avg_cost = avg_cost
+                    changed = True
                 price = price_map.get(security)
-                if price is None or price <= 0:
-                    continue
-                pos.update_price(price)
-                refreshed += 1
+                if price is not None and price > 0:
+                    pos.update_price(price)
+                    changed = True
+                if changed:
+                    refreshed += 1
 
         if refreshed:
-            log.info("刷新子账户持仓实时价格: %d 条", refreshed)
+            log.info("刷新子账户持仓成本价/实时价格: %d 条", refreshed)
         return refreshed > 0
 
     def _init_broker(self) -> None:
@@ -1901,6 +1917,8 @@ class LiveEngine:
                     sp.available_cash = float(cash)
                     sp.transferable_cash = float(cash)
                 sp.positions = dict(target.positions)
+            else:
+                self._refresh_subportfolio_prices(target, snapshot=snapshot)
 
             target.update_value()
         except Exception as exc:

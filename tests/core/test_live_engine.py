@@ -830,14 +830,20 @@ async def test_restore_subportfolios_refreshes_prices_from_broker_snapshot(tmp_p
     pos1 = engine.context.subportfolios[1].positions["000001.XSHE"]
     assert pos0.price == pytest.approx(11.0)
     assert pos0.value == pytest.approx(440.0)
+    assert pos0.avg_cost == pytest.approx(10.0)
+    assert pos0.acc_avg_cost == pytest.approx(10.0)
     assert pos1.price == pytest.approx(11.0)
     assert pos1.value == pytest.approx(660.0)
+    assert pos1.avg_cost == pytest.approx(10.0)
+    assert pos1.acc_avg_cost == pytest.approx(10.0)
     assert engine.context.subportfolios[0].total_value == pytest.approx(1440.0)
     assert engine.context.subportfolios[1].total_value == pytest.approx(2660.0)
 
     refreshed_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
     assert refreshed_snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
+    assert refreshed_snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["avg_cost"] == pytest.approx(10.0)
     assert refreshed_snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["value"] == pytest.approx(660.0)
+    assert refreshed_snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["acc_avg_cost"] == pytest.approx(10.0)
 
 
 def test_save_g_refreshes_subportfolio_prices_before_writing(tmp_path):
@@ -900,8 +906,91 @@ def test_save_g_refreshes_subportfolio_prices_before_writing(tmp_path):
     snapshot = json.loads((runtime_dir / "subportfolios.json").read_text(encoding="utf-8"))
     assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
     assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["value"] == pytest.approx(220.0)
+    assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["avg_cost"] == pytest.approx(10.0)
+    assert snapshot["subportfolios"]["0"]["positions"]["000001.XSHE"]["acc_avg_cost"] == pytest.approx(10.0)
     assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["price"] == pytest.approx(11.0)
     assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["value"] == pytest.approx(330.0)
+    assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["avg_cost"] == pytest.approx(10.0)
+    assert snapshot["subportfolios"]["1"]["positions"]["000001.XSHE"]["acc_avg_cost"] == pytest.approx(10.0)
+
+
+def test_account_snapshot_refreshes_virtual_subportfolio_costs(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(
+        type="stock",
+        available_cash=1000.0,
+        transferable_cash=1000.0,
+        total_value=1200.0,
+        positions={
+            "000001.XSHE": Position(
+                security="000001.XSHE",
+                total_amount=20,
+                closeable_amount=20,
+                avg_cost=8.0,
+                acc_avg_cost=8.0,
+                price=5.0,
+                value=100.0,
+            )
+        },
+    )
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=2000.0,
+        transferable_cash=2000.0,
+        total_value=2300.0,
+        positions={
+            "000001.XSHE": Position(
+                security="000001.XSHE",
+                total_amount=30,
+                closeable_amount=30,
+                avg_cost=8.5,
+                acc_avg_cost=8.5,
+                price=6.0,
+                value=180.0,
+            )
+        },
+    )
+
+    engine._apply_account_snapshot(
+        {
+            "available_cash": 5000.0,
+            "total_value": 6000.0,
+            "positions": [
+                {
+                    "security": "000001.XSHE",
+                    "amount": 50,
+                    "avg_cost": 12.0,
+                    "current_price": 13.0,
+                    "market_value": 650.0,
+                }
+            ],
+        }
+    )
+
+    pos0 = engine.context.subportfolios[0].positions["000001.XSHE"]
+    pos1 = engine.context.subportfolios[1].positions["000001.XSHE"]
+    assert pos0.avg_cost == pytest.approx(12.0)
+    assert pos0.acc_avg_cost == pytest.approx(12.0)
+    assert pos0.price == pytest.approx(13.0)
+    assert pos0.value == pytest.approx(260.0)
+    assert pos1.avg_cost == pytest.approx(12.0)
+    assert pos1.acc_avg_cost == pytest.approx(12.0)
+    assert pos1.price == pytest.approx(13.0)
+    assert pos1.value == pytest.approx(390.0)
 
 
 @pytest.mark.asyncio
