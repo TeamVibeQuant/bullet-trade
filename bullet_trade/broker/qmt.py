@@ -751,6 +751,20 @@ class QmtBroker(BrokerBase):
                 continue
         return orders
 
+    def heartbeat(self) -> None:
+        self._ensure_connected()
+        if not self._xt_trader or not self._xt_account:
+            self._connected = False
+            raise RuntimeError("QMT 连接对象缺失")
+        try:
+            asset = self._xt_trader.query_stock_asset(self._xt_account)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self._connected = False
+            raise RuntimeError(f"QMT 心跳查询失败: {exc}") from exc
+        if asset is None:
+            self._connected = False
+            raise RuntimeError("QMT 心跳查询返回空资产")
+
     def _map_to_jq_symbol(self, security: Optional[str]) -> Optional[str]:
         if not security:
             return None

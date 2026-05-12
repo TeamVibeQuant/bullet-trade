@@ -699,7 +699,7 @@ class MiniQMTProvider(DataProvider):
         
         # 在这里处理 count，确保停牌日数据也被包含
         if end_time and count and not df.empty:
-            logger.debug(f"QMT _fetch_local_data: 截取前 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
+            # logger.debug(f"QMT _fetch_local_data: 截取前 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
             # 先过滤掉超过原始 end_time 的数据（因为我们把 end_time 往后推了）
             try:
                 end_dt = pd.to_datetime(end_time)
@@ -710,12 +710,12 @@ class MiniQMTProvider(DataProvider):
                     df = df[df.index <= end_dt_normalized]
                 else:
                     df = df[df.index <= end_dt]
-                logger.debug(f"QMT _fetch_local_data: 过滤后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
+                # logger.debug(f"QMT _fetch_local_data: 过滤后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
             except Exception as e:
                 logger.debug(f"QMT _fetch_local_data: 过滤失败 {e}")
             # 然后再 tail(count)
             df = df.tail(count)
-            logger.debug(f"QMT _fetch_local_data: 截取后 df.index={df.index.tolist()}")
+            # logger.debug(f"QMT _fetch_local_data: 截取后 df.index={df.index.tolist()}")
         
         return df
 
