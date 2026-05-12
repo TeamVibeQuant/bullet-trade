@@ -238,6 +238,8 @@ class LiveEngine:
 
         self._risk = get_global_risk_controller() if self.config.risk_check_enabled else None
         self._order_lock: Optional[asyncio.Lock] = None
+        self._broker_reconnect_lock: Optional[asyncio.Lock] = None
+        self._last_broker_reconnect_at: Optional[datetime] = None
         self._last_account_refresh: Optional[datetime] = None
         self._orders: Dict[str, Order] = {}
         self._trades: Dict[str, Trade] = {}
@@ -306,6 +308,7 @@ class LiveEngine:
         self._loop = asyncio.get_running_loop()
         self._stop_event = asyncio.Event()
         self._order_lock = asyncio.Lock()
+        self._broker_reconnect_lock = asyncio.Lock()
         self.event_bus = EventBus(self._loop)
         self.async_scheduler = AsyncScheduler()
 
@@ -2157,7 +2160,12 @@ class LiveEngine:
         if not self.broker or not self.broker.supports_account_sync():
             return
         assert self._loop is not None
-        snapshot = await self._loop.run_in_executor(None, self.broker.sync_account)
+        try:
+            snapshot = await self._loop.run_in_executor(None, self.broker.sync_account)
+        except Exception as exc:
+            log.warning(f"账户同步失败，准备检查券商连接: {exc}")
+            await self._reconnect_broker(f"account-sync failed: {exc}")
+            return
         if snapshot:
             try:
                 self._apply_account_snapshot(snapshot)
@@ -2175,7 +2183,8 @@ class LiveEngine:
             if snapshots:
                 self._apply_order_snapshots(snapshots)
         except Exception as exc:
-            log.debug(f"订单同步失败: {exc}")
+            log.warning(f"订单同步失败，准备检查券商连接: {exc}")
+            await self._reconnect_broker(f"order-sync failed: {exc}")
 
     async def _risk_step(self) -> None:
         if not self._risk:
@@ -2191,9 +2200,66 @@ class LiveEngine:
             return
         assert self._loop is not None
         try:
+            if hasattr(self.broker, "is_connected") and not self.broker.is_connected():
+                await self._reconnect_broker("broker disconnected")
+                return
+        except Exception as exc:
+            log.debug(f"检查券商连接状态失败: {exc}")
+        try:
             await self._loop.run_in_executor(None, self.broker.heartbeat)
         except Exception as exc:
-            log.warning(f"券商心跳异常: {exc}")
+            log.warning(f"券商心跳异常，准备重连: {exc}")
+            await self._reconnect_broker(f"heartbeat failed: {exc}")
+
+    async def _reconnect_broker(self, reason: str) -> bool:
+        if not self.broker:
+            return False
+        assert self._loop is not None
+        if self._broker_reconnect_lock is None:
+            self._broker_reconnect_lock = asyncio.Lock()
+
+        async with self._broker_reconnect_lock:
+            now = self._now()
+            if self._last_broker_reconnect_at is not None:
+                elapsed = (now - self._last_broker_reconnect_at).total_seconds()
+                cooldown = max(1, min(10, int(self.config.broker_heartbeat_interval or 1)))
+                if elapsed < cooldown:
+                    log.debug("券商重连仍在冷却期: reason=%s elapsed=%.2fs", reason, elapsed)
+                    return False
+            self._last_broker_reconnect_at = now
+
+            order_lock = self._order_lock
+            if order_lock is not None:
+                await order_lock.acquire()
+            try:
+                log.warning("开始重连券商: %s", reason)
+                try:
+                    await self._loop.run_in_executor(None, self.broker.cleanup)
+                except Exception as exc:
+                    log.debug(f"券商重连前清理失败: {exc}")
+
+                await self._loop.run_in_executor(None, self.broker.connect)
+                summary = self._safe_account_info()
+                positions = summary.get('positions') or []
+                log.info(
+                    "✅ 券商重连成功: broker=%s, account_id=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
+                    self.broker.__class__.__name__,
+                    summary.get('account_id') or getattr(self.broker, 'account_id', ''),
+                    summary.get('available_cash'),
+                    summary.get('total_value'),
+                    len(positions),
+                )
+                if summary:
+                    self._apply_account_snapshot(summary)
+                    self._last_account_refresh = datetime.now()
+                self._sync_provider_subscription(initial=True)
+                return True
+            except Exception as exc:
+                log.error(f"券商重连失败: {exc}", exc_info=True)
+                return False
+            finally:
+                if order_lock is not None:
+                    order_lock.release()
 
     # ------------------------------------------------------------------
     # 工具函数
