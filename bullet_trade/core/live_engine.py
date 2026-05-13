@@ -361,7 +361,7 @@ class LiveEngine:
         set_current_context(self.context)
         register_portfolio(self._portfolio)
         register_portfolio_price_refresher(
-            lambda force_log=False: self._refresh_subportfolio_prices(self._portfolio, force_log=force_log)
+            lambda force_log=False: self._refresh_subportfolio_snapshot_for_save(force_log=force_log)
         )
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
@@ -2327,13 +2327,23 @@ class LiveEngine:
                     idx, len(sp.positions), sp.available_cash, sp.total_value,
                 )
 
-            refreshed = self._refresh_subportfolio_prices(backing)
+            broker_snapshot = None
+            try:
+                broker_snapshot = self.broker.sync_account() if self.broker and self.broker.supports_account_sync() else None
+            except Exception as exc:
+                log.debug(f"恢复子账户后获取券商快照失败: {exc}")
+
+            refreshed = self._refresh_subportfolio_prices(backing, snapshot=broker_snapshot)
+            cash_reconciled = self._reconcile_subportfolio_cash(
+                backing,
+                self._to_float((broker_snapshot or {}).get("available_cash"), default=None) if broker_snapshot else None,
+            )
             backing.update_value()
-            if refreshed:
+            if refreshed or cash_reconciled:
                 try:
                     save_g()
                 except Exception as exc:
-                    log.debug(f"恢复子账户后保存刷新价格失败: {exc}")
+                    log.debug(f"恢复子账户后保存刷新价格/现金失败: {exc}")
             return
 
         # 回退：首次启动（无快照），按比例分配券商真实资金
@@ -2447,6 +2457,25 @@ class LiveEngine:
                 log.info("刷新子账户持仓成本价/实时价格: %d 条", refreshed)
                 self._last_subportfolio_refresh_log = now
         return refreshed > 0
+
+    def _refresh_subportfolio_snapshot_for_save(self, force_log: bool = False) -> bool:
+        """Refresh subportfolio prices and broker cash before save_g writes JSON."""
+        backing = self._portfolio
+        snapshot = None
+        if self.broker and self.broker.supports_account_sync():
+            try:
+                snapshot = self.broker.sync_account()
+            except Exception as exc:
+                log.debug(f"保存子账户快照前同步券商账户失败: {exc}")
+
+        refreshed = self._refresh_subportfolio_prices(backing, snapshot=snapshot, force_log=force_log)
+        cash_reconciled = self._reconcile_subportfolio_cash(
+            backing,
+            self._to_float((snapshot or {}).get("available_cash"), default=None) if snapshot else None,
+        )
+        if refreshed or cash_reconciled:
+            backing.update_value()
+        return refreshed or cash_reconciled
 
     def _init_broker(self) -> None:
         self._ensure_broker_created()
@@ -3068,6 +3097,110 @@ class LiveEngine:
             self._apply_account_snapshot(snapshot)
             self._last_account_refresh = now
 
+    def _subportfolio_cash_sync_ratios(self, target: Portfolio) -> Dict[int, float]:
+        ratios_option = get_settings().options.get("subportfolio_external_cash_sync_ratios")
+        subs = getattr(target, "subportfolios", {}) or {}
+        ratios: Dict[int, float] = {}
+
+        if isinstance(ratios_option, dict):
+            for idx in subs.keys():
+                raw = ratios_option.get(idx, ratios_option.get(str(idx), 0.0))
+                try:
+                    ratios[idx] = max(0.0, float(raw or 0.0))
+                except Exception:
+                    ratios[idx] = 0.0
+        elif isinstance(ratios_option, (list, tuple)):
+            for idx in subs.keys():
+                try:
+                    ratios[idx] = max(0.0, float(ratios_option[idx] or 0.0))
+                except Exception:
+                    ratios[idx] = 0.0
+
+        if not ratios or sum(ratios.values()) <= 0:
+            total = sum(max(0.0, float(getattr(sp, "total_value", 0.0) or 0.0)) for sp in subs.values())
+            if total > 0:
+                ratios = {
+                    idx: max(0.0, float(getattr(sp, "total_value", 0.0) or 0.0)) / total
+                    for idx, sp in subs.items()
+                }
+            else:
+                count = len(subs)
+                ratios = {idx: 1.0 / count for idx in subs.keys()} if count else {}
+
+        total_ratio = sum(ratios.values())
+        if total_ratio <= 0:
+            return {}
+        return {idx: value / total_ratio for idx, value in ratios.items()}
+
+    def _reconcile_subportfolio_cash(self, target: Portfolio, real_cash: Optional[float]) -> bool:
+        if real_cash is None:
+            return False
+        subs = getattr(target, "subportfolios", {}) or {}
+        if len(subs) <= 1:
+            return False
+
+        virtual_cash = sum(float(getattr(sp, "available_cash", 0.0) or 0.0) for sp in subs.values())
+        cash_delta = float(real_cash) - virtual_cash
+        threshold = float(get_settings().options.get("subportfolio_external_cash_sync_threshold", 1.0) or 0.0)
+        if abs(cash_delta) < threshold:
+            return False
+
+        ratios = self._subportfolio_cash_sync_ratios(target)
+        if not ratios:
+            return False
+
+        if cash_delta > 0:
+            for idx, ratio in ratios.items():
+                sp = subs.get(idx)
+                if sp is None:
+                    continue
+                add_cash = cash_delta * ratio
+                sp.available_cash = float(sp.available_cash or 0.0) + add_cash
+                sp.transferable_cash = float(sp.transferable_cash or 0.0) + add_cash
+                sp.update_value()
+            log.info(
+                "检测到券商账户新增现金 %.2f，已按子账户比例分配: %s",
+                cash_delta,
+                {idx: round(ratio, 4) for idx, ratio in ratios.items()},
+            )
+            return True
+
+        withdraw = -cash_delta
+        remaining = withdraw
+        for idx, ratio in ratios.items():
+            sp = subs.get(idx)
+            if sp is None:
+                continue
+            reduce_cash = min(float(sp.available_cash or 0.0), withdraw * ratio)
+            sp.available_cash = float(sp.available_cash or 0.0) - reduce_cash
+            sp.transferable_cash = min(float(sp.transferable_cash or 0.0), sp.available_cash)
+            sp.update_value()
+            remaining -= reduce_cash
+
+        if remaining > threshold:
+            for sp in subs.values():
+                if remaining <= threshold:
+                    break
+                reduce_cash = min(float(sp.available_cash or 0.0), remaining)
+                sp.available_cash = float(sp.available_cash or 0.0) - reduce_cash
+                sp.transferable_cash = min(float(sp.transferable_cash or 0.0), sp.available_cash)
+                sp.update_value()
+                remaining -= reduce_cash
+
+        if remaining > threshold:
+            log.warning(
+                "券商账户现金低于虚拟子账户现金 %.2f，但虚拟现金不足以完全扣减，剩余差额 %.2f",
+                withdraw,
+                remaining,
+            )
+        else:
+            log.info(
+                "检测到券商账户现金减少 %.2f，已按子账户比例扣减: %s",
+                withdraw,
+                {idx: round(ratio, 4) for idx, ratio in ratios.items()},
+            )
+        return True
+
     def _apply_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
         try:
             target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
@@ -3142,10 +3275,20 @@ class LiveEngine:
                 if locked is not None:
                     sp.locked_cash = float(locked)
                 sp.positions = dict(target.positions)
+                cash_reconciled = False
             else:
                 self._refresh_subportfolio_prices(target, snapshot=snapshot)
+                cash_reconciled = self._reconcile_subportfolio_cash(
+                    target,
+                    float(cash) if cash is not None else None,
+                )
 
             target.update_value()
+            if cash_reconciled:
+                try:
+                    save_g()
+                except Exception as exc:
+                    log.debug(f"同步券商现金到子账户后保存运行态失败: {exc}")
         except Exception as exc:
             log.debug(f"应用账户快照失败: {exc}")
             return
