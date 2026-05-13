@@ -229,6 +229,32 @@ def _subportfolios_path() -> str:
     return os.path.join(_runtime_dir, 'subportfolios.json')
 
 
+def _snapshot_excluded_positions(pindex: Any) -> Set[str]:
+    try:
+        from .settings import get_settings
+
+        raw = get_settings().options.get('subportfolio_snapshot_excluded_positions') or {}
+    except Exception:
+        return set()
+
+    excluded: Set[str] = set()
+    if isinstance(raw, dict):
+        for key in (pindex, str(pindex)):
+            values = raw.get(key)
+            if isinstance(values, (list, tuple, set)):
+                excluded.update(str(v) for v in values if v)
+        values = raw.get('*')
+        if isinstance(values, (list, tuple, set)):
+            excluded.update(str(v) for v in values if v)
+    elif isinstance(raw, (list, tuple, set)):
+        excluded.update(str(v) for v in raw if v)
+    return excluded
+
+
+def _is_snapshot_excluded_position(security: str, excluded: Set[str]) -> bool:
+    return any(security == item or security.startswith(item) for item in excluded)
+
+
 def save_subportfolios() -> None:
     """将所有子账户的 positions + cash 序列化为 JSON。"""
     if _runtime_dir is None or _portfolio_ref is None:
@@ -259,8 +285,11 @@ def save_subportfolios() -> None:
 
         data: Dict[str, Any] = {'subportfolios': {}, 'saved_at': datetime.now().isoformat()}
         for idx, sp in subs.items():
+            excluded_positions = _snapshot_excluded_positions(idx)
             positions_data: Dict[str, Any] = {}
             for sec, pos in sp.positions.items():
+                if _is_snapshot_excluded_position(sec, excluded_positions):
+                    continue
                 try:
                     total_amount = int(getattr(pos, 'total_amount', 0) or 0)
                 except Exception:
@@ -277,12 +306,23 @@ def save_subportfolios() -> None:
                     'value': pos.value,
                     'side': getattr(pos, 'side', 'long'),
                 }
+            serialized_total_value = sp.total_value
+            if excluded_positions:
+                serialized_positions_value = sum(
+                    float(pos_data.get('value', 0.0) or 0.0)
+                    for pos_data in positions_data.values()
+                )
+                serialized_total_value = (
+                    float(getattr(sp, 'available_cash', 0.0) or 0.0)
+                    + float(getattr(sp, 'locked_cash', 0.0) or 0.0)
+                    + serialized_positions_value
+                )
             data['subportfolios'][str(idx)] = {
                 'type': sp.type,
                 'available_cash': sp.available_cash,
                 'transferable_cash': sp.transferable_cash,
                 'locked_cash': sp.locked_cash,
-                'total_value': sp.total_value,
+                'total_value': serialized_total_value,
                 'positions': positions_data,
             }
 

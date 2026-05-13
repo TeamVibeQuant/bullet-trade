@@ -2313,7 +2313,12 @@ class LiveEngine:
                     locked_cash=float(saved.get('locked_cash', 0.0)),
                     total_value=float(saved['total_value']),
                 )
+                excluded_positions = self._snapshot_excluded_positions(idx)
+                skipped_excluded = 0
                 for sec, pos_data in (saved.get('positions') or {}).items():
+                    if self._is_snapshot_excluded_position(sec, excluded_positions):
+                        skipped_excluded += 1
+                        continue
                     total_amount = int(pos_data.get('total_amount', 0) or 0)
                     if total_amount <= 0:
                         continue
@@ -2326,6 +2331,14 @@ class LiveEngine:
                         acc_avg_cost=float(pos_data.get('acc_avg_cost', pos_data.get('avg_cost', 0.0))),
                         value=float(pos_data.get('value', 0.0)),
                         side=pos_data.get('side', 'long'),
+                    )
+                if skipped_excluded:
+                    sp.update_value()
+                    log.info(
+                        "  子账户[%s]: 跳过快照排除持仓 %d 只，恢复总值调整为 %.2f",
+                        idx,
+                        skipped_excluded,
+                        sp.total_value,
                     )
                 backing.subportfolios[idx] = sp
                 log.info(
@@ -2387,11 +2400,37 @@ class LiveEngine:
             )
         self._subportfolios_restored = True
 
-    def _broker_positions_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Position]:
+    def _snapshot_excluded_positions(self, pindex: Optional[int] = None) -> Set[str]:
+        raw = get_settings().options.get("subportfolio_snapshot_excluded_positions") or {}
+        excluded: Set[str] = set()
+        if isinstance(raw, dict):
+            keys: List[Any] = ["*"]
+            if pindex is not None:
+                keys.extend([pindex, str(pindex)])
+            for key in keys:
+                values = raw.get(key)
+                if isinstance(values, (list, tuple, set)):
+                    excluded.update(str(v) for v in values if v)
+        elif isinstance(raw, (list, tuple, set)):
+            excluded.update(str(v) for v in raw if v)
+        return excluded
+
+    @staticmethod
+    def _is_snapshot_excluded_position(security: str, excluded: Set[str]) -> bool:
+        return any(security == item or security.startswith(item) for item in excluded)
+
+    def _broker_positions_from_snapshot(
+        self,
+        snapshot: Optional[Dict[str, Any]],
+        pindex: Optional[int] = None,
+    ) -> Dict[str, Position]:
+        excluded = self._snapshot_excluded_positions(pindex)
         positions: Dict[str, Position] = {}
         for item in (snapshot or {}).get("positions") or []:
             security = item.get("security")
             if not security:
+                continue
+            if self._is_snapshot_excluded_position(security, excluded):
                 continue
             amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
             if amount <= 0:
@@ -2437,14 +2476,14 @@ class LiveEngine:
         backing: Portfolio,
         snapshot: Optional[Dict[str, Any]],
     ) -> bool:
-        broker_positions = self._broker_positions_from_snapshot(snapshot)
-        if not broker_positions:
-            return False
         if self._virtual_position_amount(backing) > 0:
             return False
 
         idx = self._select_subportfolio_for_position_recovery(backing)
         if idx is None:
+            return False
+        broker_positions = self._broker_positions_from_snapshot(snapshot, pindex=idx)
+        if not broker_positions:
             return False
         sp = (getattr(backing, "subportfolios", {}) or {}).get(idx)
         if sp is None:
