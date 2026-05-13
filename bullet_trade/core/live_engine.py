@@ -252,6 +252,7 @@ class LiveEngine:
         self._tick_subscription_updated: bool = False
         self._runtime_lock: Optional[ManagedLiveLock] = None
         self._instance_lock: Optional[ManagedLiveLock] = None
+        self._subportfolios_restored: bool = False
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -359,10 +360,6 @@ class LiveEngine:
         reset_settings()
         set_current_engine(self)
         set_current_context(self.context)
-        register_portfolio(self._portfolio)
-        register_portfolio_price_refresher(
-            lambda force_log=False: self._refresh_subportfolio_snapshot_for_save(force_log=force_log)
-        )
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
 
@@ -405,6 +402,14 @@ class LiveEngine:
         # process_initialize → initialize() → set_subportfolios 会重建子账户结构。
         # 恢复逻辑：优先从 JSON 快照精确还原，回退按比例分配券商真实资金。
         self._restore_subportfolios()
+        register_portfolio(self._portfolio)
+        register_portfolio_price_refresher(
+            lambda force_log=False: self._refresh_subportfolio_snapshot_for_save(force_log=force_log)
+        )
+        try:
+            save_g()
+        except Exception as exc:
+            log.debug(f"子账户恢复完成后保存运行态失败: {exc}")
 
         self._dedupe_scheduler_tasks()
 
@@ -2292,6 +2297,7 @@ class LiveEngine:
             saved_subs = snapshot['subportfolios']
             if len(saved_subs) <= 1:
                 log.debug("子账户快照仅含 %d 个子账户，跳过恢复", len(saved_subs))
+                self._subportfolios_restored = True
                 return
             saved_at = snapshot.get('saved_at', '未知')
             log.info("从快照恢复子账户状态 (saved_at=%s)", saved_at)
@@ -2333,13 +2339,15 @@ class LiveEngine:
             except Exception as exc:
                 log.debug(f"恢复子账户后获取券商快照失败: {exc}")
 
+            recovered = self._recover_missing_subportfolio_positions(backing, broker_snapshot)
             refreshed = self._refresh_subportfolio_prices(backing, snapshot=broker_snapshot)
             cash_reconciled = self._reconcile_subportfolio_cash(
                 backing,
                 self._to_float((broker_snapshot or {}).get("available_cash"), default=None) if broker_snapshot else None,
             )
             backing.update_value()
-            if refreshed or cash_reconciled:
+            self._subportfolios_restored = True
+            if refreshed or cash_reconciled or recovered:
                 try:
                     save_g()
                 except Exception as exc:
@@ -2349,14 +2357,17 @@ class LiveEngine:
         # 回退：首次启动（无快照），按比例分配券商真实资金
         subs = backing.subportfolios
         if len(subs) <= 1:
+            self._subportfolios_restored = True
             return
 
         old_total = sum(sp.total_value for sp in subs.values())
         if old_total <= 0:
+            self._subportfolios_restored = True
             return
 
         real_total = backing.starting_cash
         if real_total <= 0 or abs(real_total - old_total) < 0.01:
+            self._subportfolios_restored = True
             return
 
         log.info(
@@ -2374,6 +2385,79 @@ class LiveEngine:
                 "  子账户[%s]: %.2f → %.2f (%.0f%%)",
                 idx, old_cash, new_cash, ratio * 100,
             )
+        self._subportfolios_restored = True
+
+    def _broker_positions_from_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Position]:
+        positions: Dict[str, Position] = {}
+        for item in (snapshot or {}).get("positions") or []:
+            security = item.get("security")
+            if not security:
+                continue
+            amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+            if amount <= 0:
+                continue
+            price = self._to_float(item.get("current_price", item.get("price")), default=0.0)
+            market_value = self._to_float(item.get("market_value"), default=0.0)
+            if price <= 0 and market_value > 0:
+                price = market_value / amount
+            positions[security] = Position(
+                security=security,
+                total_amount=amount,
+                closeable_amount=int(item.get("closeable_amount", amount)),
+                avg_cost=self._to_float(item.get("avg_cost"), default=0.0),
+                price=price,
+                value=market_value if market_value > 0 else amount * price,
+            )
+        return positions
+
+    def _virtual_position_amount(self, backing: Portfolio) -> int:
+        amount = 0
+        for sp in (getattr(backing, "subportfolios", {}) or {}).values():
+            for pos in (getattr(sp, "positions", {}) or {}).values():
+                amount += int(getattr(pos, "total_amount", 0) or 0)
+        return amount
+
+    def _select_subportfolio_for_position_recovery(self, backing: Portfolio) -> Optional[int]:
+        subs = getattr(backing, "subportfolios", {}) or {}
+        if not subs:
+            return None
+        ratios = self._subportfolio_cash_sync_ratios(backing)
+        if ratios:
+            return max(ratios, key=ratios.get)
+        return max(
+            subs,
+            key=lambda idx: (
+                float(getattr(subs[idx], "total_value", 0.0) or 0.0),
+                float(getattr(subs[idx], "available_cash", 0.0) or 0.0),
+            ),
+        )
+
+    def _recover_missing_subportfolio_positions(
+        self,
+        backing: Portfolio,
+        snapshot: Optional[Dict[str, Any]],
+    ) -> bool:
+        broker_positions = self._broker_positions_from_snapshot(snapshot)
+        if not broker_positions:
+            return False
+        if self._virtual_position_amount(backing) > 0:
+            return False
+
+        idx = self._select_subportfolio_for_position_recovery(backing)
+        if idx is None:
+            return False
+        sp = (getattr(backing, "subportfolios", {}) or {}).get(idx)
+        if sp is None:
+            return False
+
+        sp.positions = broker_positions
+        sp.update_value()
+        log.warning(
+            "子账户快照无持仓但券商账户有 %d 只持仓，已临时恢复到子账户[%s]。请确认虚拟子账户归属是否符合预期。",
+            len(broker_positions),
+            idx,
+        )
+        return True
 
     def _refresh_subportfolio_prices(
         self,
@@ -2460,6 +2544,10 @@ class LiveEngine:
 
     def _refresh_subportfolio_snapshot_for_save(self, force_log: bool = False) -> bool:
         """Refresh subportfolio prices and broker cash before save_g writes JSON."""
+        if not self._subportfolios_restored:
+            log.debug("子账户尚未完成恢复，跳过保存前刷新")
+            return "skip_save"
+
         backing = self._portfolio
         snapshot = None
         if self.broker and self.broker.supports_account_sync():
@@ -2467,15 +2555,18 @@ class LiveEngine:
                 snapshot = self.broker.sync_account()
             except Exception as exc:
                 log.debug(f"保存子账户快照前同步券商账户失败: {exc}")
+                if self._virtual_position_amount(backing) <= 0:
+                    return "skip_save"
 
+        recovered = self._recover_missing_subportfolio_positions(backing, snapshot)
         refreshed = self._refresh_subportfolio_prices(backing, snapshot=snapshot, force_log=force_log)
         cash_reconciled = self._reconcile_subportfolio_cash(
             backing,
             self._to_float((snapshot or {}).get("available_cash"), default=None) if snapshot else None,
         )
-        if refreshed or cash_reconciled:
+        if recovered or refreshed or cash_reconciled:
             backing.update_value()
-        return refreshed or cash_reconciled
+        return recovered or refreshed or cash_reconciled
 
     def _init_broker(self) -> None:
         self._ensure_broker_created()

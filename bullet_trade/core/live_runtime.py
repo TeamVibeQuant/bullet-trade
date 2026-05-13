@@ -82,13 +82,14 @@ def init_live_runtime(runtime_dir: str) -> None:
     """
     初始化 live 运行态：创建目录并尝试加载 g，同时准备扩展状态。
     """
-    global _runtime_dir, _restored_from_disk, _portfolio_price_refresher
+    global _runtime_dir, _restored_from_disk, _portfolio_ref, _portfolio_price_refresher
     _runtime_dir = os.path.abspath(os.path.expanduser(runtime_dir))
     os.makedirs(_runtime_dir, exist_ok=True)
     # 重置状态缓存
     global _state_cache
     _state_cache = None
     _restored_from_disk = False
+    _portfolio_ref = None
     _portfolio_price_refresher = None
     # 加载 g
     try:
@@ -241,10 +242,16 @@ def save_subportfolios() -> None:
 
         if _portfolio_price_refresher is not None:
             try:
-                _portfolio_price_refresher(True)
+                refresh_result = _portfolio_price_refresher(True)
+                if refresh_result == "skip_save":
+                    log.warn("🛟 保存子账户快照前刷新器要求跳过本次保存")
+                    return
             except TypeError:
                 try:
-                    _portfolio_price_refresher()
+                    refresh_result = _portfolio_price_refresher()
+                    if refresh_result == "skip_save":
+                        log.warn("🛟 保存子账户快照前刷新器要求跳过本次保存")
+                        return
                 except Exception as exc:
                     log.debug(f'🛟 保存子账户快照前刷新价格失败: {exc}')
             except Exception as exc:
