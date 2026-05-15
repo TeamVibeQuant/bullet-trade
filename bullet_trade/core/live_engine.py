@@ -232,6 +232,7 @@ class LiveEngine:
         self._provider_tick_callback_bound: bool = False
         self._tick_subscription_updated: bool = False
         self._subportfolios_restored: bool = False
+        self._pending_virtual_orders: Dict[str, Tuple[Order, _ResolvedOrder]] = {}
 
     # ------------------------------------------------------------------
     # 公共入口
@@ -712,12 +713,12 @@ class LiveEngine:
                         f"委托[{action_label}] {plan.security} 已提交，订单ID={order_id or '未知'}，"
                         f"数量={plan.amount}"
                     )
-                    
                     log.info('[LiveEngine] 等待获取订单状态...')
                     status_dict = None
                     try:
                         interval = 0.5  # seconds
                         order_status_timeout = 5  # seconds
+                        terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "partly_canceled"}
                         deadline = time.time() + order_status_timeout
                         while time.time() < deadline:
                             try:
@@ -727,17 +728,21 @@ class LiveEngine:
                                 if st:
                                     order.status = st
                                     log.info(f"[LiveEngine] 订单状态: {order.status}")
-                                    break
+                                    if str(st).lower() in terminal_statuses:
+                                        break
                             except Exception as e:
                                 log.debug(f"[LiveEngine] 获取订单状态失败 in-while-loop: {e}")
-                                pass
                             await asyncio.sleep(interval)
                     except Exception as e:
                         log.debug(f"[LiveEngine] 获取订单状态失败: {e}")
-                    
-                    if self._apply_virtual_order_fill(order, plan, status_dict):
-                        subportfolio_dirty = True
 
+                    applied_virtual_fill = self._apply_virtual_order_fill(order, plan, status_dict)
+                    if applied_virtual_fill:
+                        subportfolio_dirty = True
+                    elif order_id:
+                        status_text = str((status_dict or {}).get("status", getattr(order, "status", "")) or "").lower()
+                        if status_text not in {"rejected", "canceled", "cancelled"}:
+                            self._pending_virtual_orders[str(order_id)] = (order, plan)
                     if risk:
                         try:
                             risk.record_trade(order_value, action=action)
@@ -936,19 +941,24 @@ class LiveEngine:
         if status in {"rejected", "canceled", "cancelled"}:
             log.info("跳过虚拟子账户更新: %s 状态=%s", plan.security, status)
             return False
+        if status not in {"filled", "partly_canceled"}:
+            log.info("跳过虚拟子账户更新: %s 状态=%s，等待后续成交回报", plan.security, status or "unknown")
+            return False
 
         sp = self._get_subportfolio(plan.pindex)
         if sp is None:
             log.warning("无法更新虚拟子账户: pindex=%s 不存在", plan.pindex)
             return False
 
-        amount = int(
+        filled_amount = (
             status_snapshot.get("filled_amount")
             or status_snapshot.get("traded_volume")
             or status_snapshot.get("trade_volume")
             or status_snapshot.get("filled_volume")
-            or plan.amount
         )
+        if filled_amount is None and status == "filled":
+            filled_amount = plan.amount
+        amount = int(filled_amount or 0)
         if amount <= 0:
             return False
 
@@ -1262,6 +1272,35 @@ class LiveEngine:
         except Exception as exc:
             log.warning(f"订单同步失败，准备检查券商连接: {exc}")
             await self._reconnect_broker(f"order-sync failed: {exc}")
+            return
+
+        if not self._pending_virtual_orders:
+            return
+
+        dirty = False
+        terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "partly_canceled"}
+        for order_id, (order, plan) in list(self._pending_virtual_orders.items()):
+            try:
+                status_dict = await self.broker.get_order_status(order_id)
+                status_dict = status_dict or {}
+            except Exception as exc:
+                log.debug(f"同步待确认订单状态失败: order_id={order_id}, err={exc}")
+                continue
+
+            status_text = str(status_dict.get("status", getattr(order, "status", "")) or "").lower()
+            if status_text:
+                order.status = status_text
+            if self._apply_virtual_order_fill(order, plan, status_dict):
+                dirty = True
+                self._pending_virtual_orders.pop(order_id, None)
+            elif status_text in terminal_statuses:
+                self._pending_virtual_orders.pop(order_id, None)
+
+        if dirty:
+            try:
+                save_g()
+            except Exception as exc:
+                log.debug(f"订单同步后保存运行态失败: {exc}")
 
     async def _risk_step(self) -> None:
         try:
@@ -2265,10 +2304,14 @@ class LiveEngine:
                 cash_reconciled = False
             else:
                 self._refresh_subportfolio_prices(target, snapshot=snapshot)
-                cash_reconciled = self._reconcile_subportfolio_cash(
-                    target,
-                    float(cash) if cash is not None else None,
-                )
+                if self._pending_virtual_orders:
+                    log.debug("存在未确认券商订单，跳过本轮多子账户现金对账")
+                    cash_reconciled = False
+                else:
+                    cash_reconciled = self._reconcile_subportfolio_cash(
+                        target,
+                        float(cash) if cash is not None else None,
+                    )
 
             target.update_value()
             if cash_reconciled:
