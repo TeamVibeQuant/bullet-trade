@@ -2440,6 +2440,351 @@ async def test_live_order_updates_virtual_subportfolio_by_pindex(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_target_zero_sell_syncs_unique_subportfolio_quantity_from_broker(monkeypatch, tmp_path):
+    class PositionSyncBroker(DummyBroker):
+        def __init__(self):
+            super().__init__()
+            self.position_amount = 6600
+
+        def sync_account(self):
+            self.account_sync_calls += 1
+            if self.position_amount <= 0:
+                return {
+                    "available_cash": 138600.0,
+                    "total_value": 138600.0,
+                    "positions": [],
+                }
+            return {
+                "available_cash": 0.0,
+                "total_value": 138600.0,
+                "positions": [
+                    {
+                        "security": "600188.XSHG",
+                        "amount": self.position_amount,
+                        "closeable_amount": self.position_amount,
+                        "avg_cost": 20.0,
+                        "current_price": 21.0,
+                        "market_value": 138600.0,
+                    }
+                ],
+            }
+
+        async def sell(
+            self,
+            security: str,
+            amount: int,
+            price: float | None = None,
+            wait_timeout: float | None = None,
+            remark: str | None = None,
+            *,
+            market: bool = False,
+        ) -> str:
+            order_id = await super().sell(
+                security,
+                amount,
+                price,
+                wait_timeout=wait_timeout,
+                remark=remark,
+                market=market,
+            )
+            self.position_amount = max(0, self.position_amount - amount)
+            return order_id
+
+        async def get_order_status(self, order_id: str):
+            return {"order_id": order_id, "status": "filled", "price": 21.0}
+
+    strategy = _write_strategy(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=PositionSyncBroker,
+        live_config={
+            "runtime_dir": str(runtime_dir),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine.broker = PositionSyncBroker()
+    engine._risk = None
+    init_live_runtime(str(runtime_dir))
+    register_portfolio(engine._portfolio)
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(type="stock", available_cash=0.0, total_value=0.0)
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=0.0,
+        transferable_cash=0.0,
+        total_value=115500.0,
+        positions={
+            "600188.XSHG": Position(
+                security="600188.XSHG",
+                total_amount=5500,
+                closeable_amount=5500,
+                avg_cost=20.0,
+                price=21.0,
+                value=115500.0,
+            )
+        },
+    )
+    engine._portfolio.update_value()
+
+    class Snap:
+        paused = False
+        last_price = 21.0
+        high_limit = 23.0
+        low_limit = 18.9
+
+    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"600188.XSHG": Snap()})
+
+    clear_order_queue()
+    set_current_engine(None)
+    order_target_value("600188.XSHG", 0.0, pindex=1)
+    await engine._process_orders(engine.context.current_dt)
+
+    assert engine.broker.orders
+    security, amount, _, side, _ = engine.broker.orders[0]
+    assert (security, amount, side) == ("600188.XSHG", 6600, "sell")
+    assert "600188.XSHG" not in engine.context.subportfolios[1].positions
+    assert engine.context.subportfolios[1].available_cash == pytest.approx(6600 * 21.0)
+
+
+def test_save_g_and_context_subportfolios_sync_unique_quantity_from_broker(tmp_path):
+    class PositionSyncBroker(DummyBroker):
+        def sync_account(self):
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 0.0,
+                "total_value": 138600.0,
+                "positions": [
+                    {
+                        "security": "600188.XSHG",
+                        "amount": 6600,
+                        "closeable_amount": 6600,
+                        "avg_cost": 20.0,
+                        "current_price": 21.0,
+                        "market_value": 138600.0,
+                    }
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    runtime_dir = tmp_path / "runtime"
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=PositionSyncBroker,
+        live_config={
+            "runtime_dir": str(runtime_dir),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine.broker = PositionSyncBroker()
+    engine._subportfolios_restored = True
+    init_live_runtime(str(runtime_dir))
+    register_portfolio(engine._portfolio)
+    register_portfolio_price_refresher(
+        lambda force_log=False: engine._refresh_subportfolio_snapshot_for_save(force_log=force_log)
+    )
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(type="stock", available_cash=0.0, total_value=0.0)
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=0.0,
+        transferable_cash=0.0,
+        total_value=115500.0,
+        positions={
+            "600188.XSHG": Position(
+                security="600188.XSHG",
+                total_amount=5500,
+                closeable_amount=5500,
+                avg_cost=19.0,
+                price=20.0,
+                value=110000.0,
+            )
+        },
+    )
+    engine._portfolio.update_value()
+
+    pos = engine.context.subportfolios[1].positions["600188.XSHG"]
+    assert pos.total_amount == 6600
+    assert pos.closeable_amount == 6600
+    assert pos.price == pytest.approx(21.0)
+
+    save_g()
+
+    snapshot = json.loads((runtime_dir / "subportfolios.json").read_text(encoding="utf-8"))
+    saved_pos = snapshot["subportfolios"]["1"]["positions"]["600188.XSHG"]
+    assert saved_pos["total_amount"] == 6600
+    assert saved_pos["closeable_amount"] == 6600
+    assert saved_pos["price"] == pytest.approx(21.0)
+    assert saved_pos["value"] == pytest.approx(138600.0)
+
+
+def test_broker_only_position_recovery_warning_only_on_save_g(tmp_path, caplog):
+    from bullet_trade.core.settings import get_settings, set_option
+
+    class BrokerOnlyPositionBroker(DummyBroker):
+        def sync_account(self):
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 0.0,
+                "total_value": 138600.0,
+                "positions": [
+                    {
+                        "security": "600188.XSHG",
+                        "amount": 6600,
+                        "closeable_amount": 6600,
+                        "avg_cost": 20.0,
+                        "current_price": 21.0,
+                        "market_value": 138600.0,
+                    }
+                ],
+            }
+
+    def make_engine(runtime_dir: Path) -> LiveEngine:
+        engine = LiveEngine(
+            strategy_file=_write_strategy(tmp_path),
+            broker_factory=BrokerOnlyPositionBroker,
+            live_config={
+                "runtime_dir": str(runtime_dir),
+                "g_autosave_enabled": False,
+                "account_sync_enabled": False,
+                "order_sync_enabled": False,
+                "tick_sync_enabled": False,
+                "risk_check_enabled": False,
+                "broker_heartbeat_interval": 0,
+            },
+        )
+        engine.broker = BrokerOnlyPositionBroker()
+        engine._subportfolios_restored = True
+        init_live_runtime(str(runtime_dir))
+        register_portfolio(engine._portfolio)
+        register_portfolio_price_refresher(
+            lambda force_log=False: engine._refresh_subportfolio_snapshot_for_save(force_log=force_log)
+        )
+        engine._portfolio.subportfolios.clear()
+        engine._portfolio.subportfolios[0] = SubPortfolio(type="stock", available_cash=0.0, total_value=0.0)
+        engine._portfolio.subportfolios[1] = SubPortfolio(
+            type="stock",
+            available_cash=0.0,
+            total_value=1000.0,
+            positions={
+                "000001.XSHE": Position(
+                    security="000001.XSHE",
+                    total_amount=100,
+                    closeable_amount=100,
+                    avg_cost=10.0,
+                    price=10.0,
+                    value=1000.0,
+                )
+            },
+        )
+        engine._portfolio.update_value()
+        return engine
+
+    settings = get_settings()
+    old_ratios = settings.options.get("subportfolio_external_cash_sync_ratios")
+    try:
+        set_option("subportfolio_external_cash_sync_ratios", {0: 0.0, 1: 1.0})
+        warning_text = "券商持仓未在子账户快照中找到，已恢复到子账户"
+
+        caplog.set_level("WARNING", logger="jq_strategy")
+        engine = make_engine(tmp_path / "account_sync_runtime")
+        engine._apply_account_snapshot(engine.broker.sync_account())
+        assert warning_text not in caplog.text
+        assert "600188.XSHG" in engine._portfolio.subportfolios[1].positions
+
+        caplog.clear()
+        make_engine(tmp_path / "save_runtime")
+        save_g()
+        assert warning_text in caplog.text
+    finally:
+        if old_ratios is None:
+            settings.options.pop("subportfolio_external_cash_sync_ratios", None)
+        else:
+            set_option("subportfolio_external_cash_sync_ratios", old_ratios)
+
+
+def test_save_g_does_not_restore_snapshot_excluded_broker_positions(tmp_path):
+    from bullet_trade.core.settings import get_settings, set_option
+
+    class ExcludedPositionBroker(DummyBroker):
+        def sync_account(self):
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 0.0,
+                "total_value": 138600.0,
+                "positions": [
+                    {
+                        "security": "600188.XSHG",
+                        "amount": 6600,
+                        "closeable_amount": 6600,
+                        "avg_cost": 20.0,
+                        "current_price": 21.0,
+                        "market_value": 138600.0,
+                    }
+                ],
+            }
+
+    settings = get_settings()
+    old_excluded = settings.options.get("subportfolio_snapshot_excluded_positions")
+    old_ratios = settings.options.get("subportfolio_external_cash_sync_ratios")
+    try:
+        set_option("subportfolio_snapshot_excluded_positions", {1: ["600188.XSHG"]})
+        set_option("subportfolio_external_cash_sync_ratios", {0: 0.0, 1: 1.0})
+
+        strategy = _write_strategy(tmp_path)
+        runtime_dir = tmp_path / "runtime"
+        engine = LiveEngine(
+            strategy_file=strategy,
+            broker_factory=ExcludedPositionBroker,
+            live_config={
+                "runtime_dir": str(runtime_dir),
+                "g_autosave_enabled": False,
+                "account_sync_enabled": False,
+                "order_sync_enabled": False,
+                "tick_sync_enabled": False,
+                "risk_check_enabled": False,
+                "broker_heartbeat_interval": 0,
+            },
+        )
+        engine.broker = ExcludedPositionBroker()
+        engine._subportfolios_restored = True
+        init_live_runtime(str(runtime_dir))
+        register_portfolio(engine._portfolio)
+        register_portfolio_price_refresher(
+            lambda force_log=False: engine._refresh_subportfolio_snapshot_for_save(force_log=force_log)
+        )
+        engine._portfolio.subportfolios.clear()
+        engine._portfolio.subportfolios[0] = SubPortfolio(type="stock", available_cash=0.0, total_value=0.0)
+        engine._portfolio.subportfolios[1] = SubPortfolio(type="stock", available_cash=0.0, total_value=0.0)
+        engine._portfolio.update_value()
+
+        save_g()
+
+        snapshot = json.loads((runtime_dir / "subportfolios.json").read_text(encoding="utf-8"))
+        assert "600188.XSHG" not in snapshot["subportfolios"]["0"]["positions"]
+        assert "600188.XSHG" not in snapshot["subportfolios"]["1"]["positions"]
+    finally:
+        if old_excluded is None:
+            settings.options.pop("subportfolio_snapshot_excluded_positions", None)
+        else:
+            set_option("subportfolio_snapshot_excluded_positions", old_excluded)
+        if old_ratios is None:
+            settings.options.pop("subportfolio_external_cash_sync_ratios", None)
+        else:
+            set_option("subportfolio_external_cash_sync_ratios", old_ratios)
+
+
+@pytest.mark.asyncio
 async def test_restore_subportfolios_refreshes_prices_from_broker_snapshot(tmp_path):
     strategy = _write_strategy(tmp_path)
     runtime_dir = tmp_path / "runtime"

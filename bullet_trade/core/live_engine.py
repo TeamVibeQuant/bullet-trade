@@ -254,6 +254,8 @@ class LiveEngine:
         self._instance_lock: Optional[ManagedLiveLock] = None
         self._subportfolios_restored: bool = False
         self._pending_virtual_orders: Dict[str, Tuple[Order, _ResolvedOrder]] = {}
+        self._suppress_cash_reconcile_until: Optional[datetime] = None
+        self._suppress_position_sync_until: Optional[datetime] = None
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -713,9 +715,15 @@ class LiveEngine:
             open_position_symbols = self._get_open_position_symbols()
             pending_new_positions: Set[str] = set()
             submitted_buys: Dict[str, Dict[str, Any]] = {}
+            broker_positions_for_order_sync = await self._load_broker_positions_for_order_sync(orders)
             subportfolio_dirty = False
             for order in orders:
                 self._register_order(order)
+                if broker_positions_for_order_sync is not None:
+                    subportfolio_dirty = (
+                        self._sync_order_position_from_broker(order, broker_positions_for_order_sync)
+                        or subportfolio_dirty
+                    )
                 plan = self._build_order_plan(order, current_data)
                 if not plan:
                     try:
@@ -853,6 +861,8 @@ class LiveEngine:
                     applied_virtual_fill = self._apply_virtual_order_fill(order, plan, status_dict)
                     if applied_virtual_fill:
                         subportfolio_dirty = True
+                        self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
+                        self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
                     elif order_id:
                         status_text = str((status_dict or {}).get("status", getattr(order, "status", "")) or "").lower()
                         if status_text not in {"rejected", "canceled", "cancelled"}:
@@ -900,7 +910,7 @@ class LiveEngine:
                 log.debug(f"订单执行后同步成交快照失败: {exc}")
             self._trace_submitted_buys("post_broker_sync", submitted_buys, order_snapshots, trade_snapshots)
             try:
-                self.refresh_account_snapshot(force=True)
+                self.refresh_account_snapshot(force=True, reconcile_cash=False)
             except Exception as exc:
                 log.debug(f"订单执行后刷新账户快照失败: {exc}")
             self._trace_submitted_buys("post_account_refresh", submitted_buys, order_snapshots, trade_snapshots)
@@ -1870,6 +1880,114 @@ class LiveEngine:
             return 0
         return int(pos.closeable_amount or pos.total_amount or 0)
 
+    async def _load_broker_positions_for_order_sync(
+        self,
+        orders: List[Order],
+    ) -> Optional[Dict[str, Position]]:
+        """Fetch broker positions once before resolving orders that touch known virtual positions."""
+        if not self.broker or not self.broker.supports_account_sync():
+            return None
+        subs = getattr(self._portfolio_backing(), "subportfolios", {}) or {}
+        if len(subs) <= 1:
+            return None
+
+        need_sync = False
+        for order in orders:
+            sp = self._get_subportfolio(self._get_order_pindex(order))
+            if sp is None:
+                continue
+            pos = (getattr(sp, "positions", {}) or {}).get(order.security)
+            if pos is not None and int(getattr(pos, "total_amount", 0) or 0) > 0:
+                need_sync = True
+                break
+        if not need_sync:
+            return None
+
+        try:
+            if self._loop and self._loop.is_running():
+                snapshot = await self._loop.run_in_executor(None, self.broker.sync_account)
+            else:
+                snapshot = self.broker.sync_account()
+        except Exception as exc:
+            log.debug(f"下单前同步券商持仓失败: {exc}")
+            return None
+        if not snapshot:
+            return None
+        return self._broker_positions_from_snapshot(snapshot)
+
+    def _sync_order_position_from_broker(
+        self,
+        order: Order,
+        broker_positions: Dict[str, Position],
+    ) -> bool:
+        """Align a uniquely owned virtual position with broker quantity before sizing an order."""
+        security = order.security
+        pindex = self._get_order_pindex(order)
+        sp = self._get_subportfolio(pindex)
+        if sp is None:
+            return False
+        pos = (getattr(sp, "positions", {}) or {}).get(security)
+        if pos is None or int(getattr(pos, "total_amount", 0) or 0) <= 0:
+            return False
+        if self._is_snapshot_excluded_position(security, self._snapshot_excluded_positions(pindex)):
+            return False
+
+        owners = []
+        for idx, owner_sp in (getattr(self._portfolio_backing(), "subportfolios", {}) or {}).items():
+            owner_pos = (getattr(owner_sp, "positions", {}) or {}).get(security)
+            if owner_pos is not None and int(getattr(owner_pos, "total_amount", 0) or 0) > 0:
+                owners.append(idx)
+        if owners != [pindex]:
+            return False
+
+        broker_pos = broker_positions.get(security)
+        if broker_pos is None or int(getattr(broker_pos, "total_amount", 0) or 0) <= 0:
+            return False
+
+        old_total, old_closeable, changed = self._apply_broker_position_to_virtual(pos, broker_pos)
+        sp.update_value()
+        self._portfolio_backing().update_value()
+
+        if changed:
+            log.warning(
+                "下单前按券商持仓纠偏: pindex=%s, %s, total %d->%d, closeable %d->%d",
+                pindex,
+                security,
+                old_total,
+                int(pos.total_amount or 0),
+                old_closeable,
+                int(pos.closeable_amount or 0),
+            )
+        return changed
+
+    def _apply_broker_position_to_virtual(
+        self,
+        pos: Position,
+        broker_pos: Position,
+    ) -> Tuple[int, int, bool]:
+        old_total = int(getattr(pos, "total_amount", 0) or 0)
+        old_closeable = int(getattr(pos, "closeable_amount", 0) or 0)
+        old_price = float(getattr(pos, "price", 0.0) or 0.0)
+        old_cost = float(getattr(pos, "avg_cost", 0.0) or 0.0)
+
+        new_total = int(broker_pos.total_amount or 0)
+        new_closeable = max(0, min(int(broker_pos.closeable_amount or 0), new_total))
+        pos.total_amount = new_total
+        pos.closeable_amount = new_closeable
+        if broker_pos.avg_cost > 0:
+            pos.avg_cost = broker_pos.avg_cost
+            pos.acc_avg_cost = broker_pos.avg_cost
+        if broker_pos.price > 0:
+            pos.price = broker_pos.price
+        pos.value = broker_pos.value if broker_pos.value > 0 else pos.total_amount * pos.price
+        changed = (
+            old_total != int(pos.total_amount or 0)
+            or old_closeable != int(pos.closeable_amount or 0)
+            or abs(old_price - float(pos.price or 0.0)) > 1e-9
+            or abs(old_cost - float(pos.avg_cost or 0.0)) > 1e-9
+        )
+        return old_total, old_closeable, changed
+
     def _apply_virtual_order_fill(
         self,
         order: Order,
@@ -2244,6 +2362,8 @@ class LiveEngine:
                 order.status = status_text
             if self._apply_virtual_order_fill(order, plan, status_dict):
                 dirty = True
+                self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
+                self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
                 self._pending_virtual_orders.pop(order_id, None)
             elif status_text in terminal_statuses:
                 self._pending_virtual_orders.pop(order_id, None)
@@ -2561,6 +2681,142 @@ class LiveEngine:
         )
         return True
 
+    def _position_owner_indices(self, backing: Portfolio, security: str) -> List[int]:
+        owners: List[int] = []
+        for idx, sp in (getattr(backing, "subportfolios", {}) or {}).items():
+            if self._is_snapshot_excluded_position(security, self._snapshot_excluded_positions(idx)):
+                continue
+            pos = (getattr(sp, "positions", {}) or {}).get(security)
+            if pos is not None and int(getattr(pos, "total_amount", 0) or 0) > 0:
+                owners.append(idx)
+        return owners
+
+    def _is_snapshot_excluded_for_any_subportfolio(self, backing: Portfolio, security: str) -> bool:
+        for idx in (getattr(backing, "subportfolios", {}) or {}).keys():
+            if self._is_snapshot_excluded_position(security, self._snapshot_excluded_positions(idx)):
+                return True
+        return self._is_snapshot_excluded_position(security, self._snapshot_excluded_positions(None))
+
+    def _select_subportfolio_for_broker_only_position(
+        self,
+        backing: Portfolio,
+        security: str,
+    ) -> Optional[int]:
+        ratios = self._subportfolio_cash_sync_ratios(backing)
+        candidates = [
+            idx
+            for idx, ratio in ratios.items()
+            if ratio > 0 and not self._is_snapshot_excluded_position(security, self._snapshot_excluded_positions(idx))
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        if self._virtual_position_amount(backing) <= 0:
+            idx = self._select_subportfolio_for_position_recovery(backing)
+            if idx is not None and not self._is_snapshot_excluded_position(
+                security,
+                self._snapshot_excluded_positions(idx),
+            ):
+                return idx
+        return None
+
+    def _sync_subportfolio_positions_from_broker_snapshot(
+        self,
+        backing: Portfolio,
+        snapshot: Optional[Dict[str, Any]],
+        force_log: bool = False,
+        log_broker_only_recovery: bool = False,
+    ) -> bool:
+        """Synchronize virtual subportfolio quantities when broker ownership is unambiguous."""
+        if self._suppress_position_sync_until and datetime.now() < self._suppress_position_sync_until:
+            log.debug("刚完成虚拟成交更新，跳过本轮多子账户持仓同步")
+            return False
+        if snapshot is None or "positions" not in snapshot:
+            return False
+        subs = getattr(backing, "subportfolios", {}) or {}
+        if len(subs) <= 1:
+            return False
+        broker_positions = {
+            security: pos
+            for security, pos in self._broker_positions_from_snapshot(snapshot).items()
+            if not self._is_snapshot_excluded_for_any_subportfolio(backing, security)
+        }
+
+        changed = False
+        updated = 0
+        added = 0
+        removed = 0
+        skipped_multi_owner = 0
+
+        for security, broker_pos in broker_positions.items():
+            owners = self._position_owner_indices(backing, security)
+            if len(owners) == 1:
+                sp = subs.get(owners[0])
+                pos = (getattr(sp, "positions", {}) or {}).get(security) if sp is not None else None
+                if sp is None or pos is None:
+                    continue
+                _, _, pos_changed = self._apply_broker_position_to_virtual(pos, broker_pos)
+                if pos_changed:
+                    updated += 1
+                    changed = True
+                sp.update_value()
+                continue
+            if len(owners) > 1:
+                skipped_multi_owner += 1
+                continue
+
+            idx = self._select_subportfolio_for_broker_only_position(backing, security)
+            sp = subs.get(idx) if idx is not None else None
+            if sp is None:
+                continue
+            sp.positions[security] = Position(
+                security=security,
+                total_amount=int(broker_pos.total_amount or 0),
+                closeable_amount=max(0, min(int(broker_pos.closeable_amount or 0), int(broker_pos.total_amount or 0))),
+                avg_cost=float(broker_pos.avg_cost or 0.0),
+                price=float(broker_pos.price or 0.0),
+                acc_avg_cost=float(broker_pos.acc_avg_cost or broker_pos.avg_cost or 0.0),
+                value=float(broker_pos.value or 0.0),
+                side=getattr(broker_pos, "side", "long"),
+            )
+            sp.update_value()
+            added += 1
+            changed = True
+            if log_broker_only_recovery:
+                log.warning("券商持仓未在子账户快照中找到，已恢复到子账户[%s]: %s", idx, security)
+
+        virtual_securities = set()
+        for sp in subs.values():
+            virtual_securities.update((getattr(sp, "positions", {}) or {}).keys())
+        for security in sorted(virtual_securities - set(broker_positions.keys())):
+            if self._is_snapshot_excluded_for_any_subportfolio(backing, security):
+                continue
+            owners = self._position_owner_indices(backing, security)
+            if len(owners) != 1:
+                if len(owners) > 1:
+                    skipped_multi_owner += 1
+                continue
+            idx = owners[0]
+            sp = subs.get(idx)
+            if sp is None:
+                continue
+            sp.positions.pop(security, None)
+            sp.update_value()
+            removed += 1
+            changed = True
+            log.warning("券商账户已无该持仓，已从子账户[%s]快照移除: %s", idx, security)
+
+        if changed:
+            backing.update_value()
+        if changed or (force_log and skipped_multi_owner):
+            log.info(
+                "同步券商持仓到子账户: 更新%d只, 新增%d只, 移除%d只, 多归属跳过%d只",
+                updated,
+                added,
+                removed,
+                skipped_multi_owner,
+            )
+        return changed
+
     def _refresh_subportfolio_prices(
         self,
         backing: Portfolio,
@@ -2661,14 +2917,20 @@ class LiveEngine:
                     return "skip_save"
 
         recovered = self._recover_missing_subportfolio_positions(backing, snapshot)
+        synced_positions = self._sync_subportfolio_positions_from_broker_snapshot(
+            backing,
+            snapshot=snapshot,
+            force_log=force_log,
+            log_broker_only_recovery=True,
+        )
         refreshed = self._refresh_subportfolio_prices(backing, snapshot=snapshot, force_log=force_log)
         cash_reconciled = self._reconcile_subportfolio_cash(
             backing,
             self._to_float((snapshot or {}).get("available_cash"), default=None) if snapshot else None,
         )
-        if recovered or refreshed or cash_reconciled:
+        if recovered or synced_positions or refreshed or cash_reconciled:
             backing.update_value()
-        return recovered or refreshed or cash_reconciled
+        return recovered or synced_positions or refreshed or cash_reconciled
 
     def _init_broker(self) -> None:
         self._ensure_broker_created()
@@ -3275,7 +3537,7 @@ class LiveEngine:
                 continue
         return periods
 
-    def refresh_account_snapshot(self, force: bool = False) -> None:
+    def refresh_account_snapshot(self, force: bool = False, reconcile_cash: bool = True) -> None:
         if not self.broker or not self.broker.supports_account_sync():
             return
         now = datetime.now()
@@ -3287,7 +3549,7 @@ class LiveEngine:
             log.debug(f"即时账户刷新失败: {exc}")
             return
         if snapshot:
-            self._apply_account_snapshot(snapshot)
+            self._apply_account_snapshot(snapshot, reconcile_cash=reconcile_cash)
             self._last_account_refresh = now
 
     def _subportfolio_cash_sync_ratios(self, target: Portfolio) -> Dict[int, float]:
@@ -3327,6 +3589,9 @@ class LiveEngine:
 
     def _reconcile_subportfolio_cash(self, target: Portfolio, real_cash: Optional[float]) -> bool:
         if real_cash is None:
+            return False
+        if self._suppress_cash_reconcile_until and datetime.now() < self._suppress_cash_reconcile_until:
+            log.debug("刚完成虚拟成交更新，跳过本轮多子账户现金对账")
             return False
         subs = getattr(target, "subportfolios", {}) or {}
         if len(subs) <= 1:
@@ -3394,7 +3659,7 @@ class LiveEngine:
             )
         return True
 
-    def _apply_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
+    def _apply_account_snapshot(self, snapshot: Dict[str, Any], reconcile_cash: bool = True) -> None:
         try:
             target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
             cash = snapshot.get('available_cash')
@@ -3470,8 +3735,11 @@ class LiveEngine:
                 sp.positions = dict(target.positions)
                 cash_reconciled = False
             else:
+                self._sync_subportfolio_positions_from_broker_snapshot(target, snapshot=snapshot)
                 self._refresh_subportfolio_prices(target, snapshot=snapshot)
-                if self._pending_virtual_orders:
+                if not reconcile_cash:
+                    cash_reconciled = False
+                elif self._pending_virtual_orders:
                     log.debug("存在未确认券商订单，跳过本轮多子账户现金对账")
                     cash_reconciled = False
                 else:
