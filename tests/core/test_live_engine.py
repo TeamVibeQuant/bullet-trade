@@ -29,6 +29,8 @@ from bullet_trade.core.live_engine import (
     LiveEngine,
     LivePortfolioProxy,
     TradingCalendarGuard,
+    _PendingVirtualOrder,
+    _ResolvedOrder,
 )
 from bullet_trade.core.live_lock import LiveLockBusyError
 from bullet_trade.core.live_runtime import (
@@ -3157,6 +3159,82 @@ async def test_order_waits_until_processed(monkeypatch, tmp_path):
     await order_task
     assert len(engine.broker.orders) == 1
     set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_pending_missing_broker_order_expires_without_virtual_fill(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": True,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+        "pending_order_timeout": 5,
+    }
+
+    class MissingOrderBroker(DummyBroker):
+        def __init__(self):
+            super().__init__()
+            self.cancelled: list[str] = []
+
+        async def cancel_order(self, order_id: str) -> bool:
+            self.cancelled.append(order_id)
+            return False
+
+        async def get_order_status(self, order_id: str):
+            return {}
+
+        def sync_orders(self):
+            self.order_sync_calls += 1
+            return []
+
+    broker = MissingOrderBroker()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=MissingOrderBroker,
+        live_config=cfg,
+    )
+
+    class InlineLoop:
+        async def run_in_executor(self, executor, func, *args):
+            return func(*args)
+
+    engine._loop = InlineLoop()
+    engine.broker = broker
+
+    order = Order(
+        order_id="local-1",
+        security="688981.XSHG",
+        amount=200,
+        price=116.44,
+        is_buy=False,
+        pindex=1,
+    )
+    plan = _ResolvedOrder(
+        security="688981.XSHG",
+        amount=200,
+        is_buy=False,
+        price=116.44,
+        last_price=125.5,
+        pindex=1,
+        wait_timeout=20,
+        is_market=False,
+    )
+    engine._pending_virtual_orders["broker-ghost-1"] = _PendingVirtualOrder(
+        order=order,
+        plan=plan,
+        created_at=datetime.now() - timedelta(seconds=120),
+        last_status="open",
+    )
+
+    await engine._order_sync_step()
+
+    assert engine._pending_virtual_orders == {}
+    assert order.status == "canceled"
+    assert broker.cancelled == ["broker-ghost-1"]
 
 
 def test_live_engine_run_returns_nonzero_on_error(tmp_path, monkeypatch, caplog):

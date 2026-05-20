@@ -303,6 +303,8 @@ def get_live_trade_config() -> dict:
 
     - order_sync_interval / enabled: 订单轮询间隔秒及开关（默认 10 / True）
 
+    - pending_order_timeout: 待确认订单最大保留秒数（默认 max(60, TRADE_MAX_WAIT_TIME*3)）
+
     - g_autosave_interval / enabled: g 自动保存间隔及开关（默认 60 / True）
 
     - tick_subscription_limit: Tick 订阅标的上限（默认 100）
@@ -327,6 +329,10 @@ def get_live_trade_config() -> dict:
         "account_sync_enabled": get_env_bool("ACCOUNT_SYNC_ENABLED", True),
         "order_sync_interval": get_env_int("ORDER_SYNC_INTERVAL", 10),
         "order_sync_enabled": get_env_bool("ORDER_SYNC_ENABLED", True),
+        "pending_order_timeout": get_env_int(
+            "PENDING_ORDER_TIMEOUT",
+            max(60, get_env_int("TRADE_MAX_WAIT_TIME", 16) * 3),
+        ),
         "g_autosave_interval": get_env_int("G_AUTOSAVE_INTERVAL", 60),
         "g_autosave_enabled": get_env_bool("G_AUTOSAVE_ENABLED", True),
         "tick_subscription_limit": get_env_int("TICK_SUBSCRIPTION_LIMIT", 100),
