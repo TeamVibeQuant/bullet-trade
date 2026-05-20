@@ -115,15 +115,18 @@ class LiveConfig:
     calendar_skip_weekend: bool = True
     calendar_retry_minutes: int = 20
     portfolio_refresh_throttle_ms: int = 200
+    pending_order_timeout: int = 60
 
     @classmethod
     def load(cls, overrides: Optional[Dict[str, Any]] = None) -> "LiveConfig":
         raw = get_live_trade_config()
         if overrides:
             raw.update(overrides)
+        trade_max_wait_time = int(raw.get('trade_max_wait_time', 16))
+        default_pending_order_timeout = max(60, trade_max_wait_time * 3)
         return cls(
             order_max_volume=int(raw.get('order_max_volume', 1_000_000)),
-            trade_max_wait_time=int(raw.get('trade_max_wait_time', 16)),
+            trade_max_wait_time=trade_max_wait_time,
             event_time_out=int(raw.get('event_time_out', 60)),
             scheduler_market_periods=raw.get('scheduler_market_periods'),
             account_sync_interval=int(raw.get('account_sync_interval', 60)),
@@ -142,6 +145,12 @@ class LiveConfig:
             buy_price_percent=float(raw.get('market_buy_price_percent', 0.015)),
             sell_price_percent=float(raw.get('market_sell_price_percent', -0.015)),
             portfolio_refresh_throttle_ms=int(raw.get('portfolio_refresh_throttle_ms', 200)),
+            pending_order_timeout=int(
+                raw.get(
+                    'pending_order_timeout',
+                    raw.get('pending_order_open_timeout', default_pending_order_timeout),
+                )
+            ),
         )
 
 
@@ -155,6 +164,17 @@ class _ResolvedOrder:
     pindex: int
     wait_timeout: Optional[float]
     is_market: bool
+
+
+@dataclass
+class _PendingVirtualOrder:
+    order: Order
+    plan: _ResolvedOrder
+    created_at: datetime
+    last_status: str = ""
+    last_status_at: Optional[datetime] = None
+    last_seen_in_broker_orders: Optional[datetime] = None
+    last_open_log_at: Optional[datetime] = None
 
 
 class LiveEngine:
@@ -232,7 +252,7 @@ class LiveEngine:
         self._provider_tick_callback_bound: bool = False
         self._tick_subscription_updated: bool = False
         self._subportfolios_restored: bool = False
-        self._pending_virtual_orders: Dict[str, Tuple[Order, _ResolvedOrder]] = {}
+        self._pending_virtual_orders: Dict[str, _PendingVirtualOrder] = {}
         self._suppress_cash_reconcile_until: Optional[datetime] = None
         self._suppress_position_sync_until: Optional[datetime] = None
 
@@ -750,9 +770,17 @@ class LiveEngine:
                         self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
                         self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
                     elif order_id:
-                        status_text = str((status_dict or {}).get("status", getattr(order, "status", "")) or "").lower()
+                        status_text = self._status_to_text(
+                            (status_dict or {}).get("status", getattr(order, "status", ""))
+                        )
                         if status_text not in {"rejected", "canceled", "cancelled"}:
-                            self._pending_virtual_orders[str(order_id)] = (order, plan)
+                            self._pending_virtual_orders[str(order_id)] = _PendingVirtualOrder(
+                                order=order,
+                                plan=plan,
+                                created_at=datetime.now(),
+                                last_status=status_text,
+                                last_status_at=datetime.now() if status_text else None,
+                            )
                     if risk:
                         try:
                             risk.record_trade(order_value, action=action)
@@ -1043,6 +1071,8 @@ class LiveEngine:
         order: Order,
         plan: _ResolvedOrder,
         status_snapshot: Optional[Dict[str, Any]] = None,
+        *,
+        log_waiting: bool = True,
     ) -> bool:
         """Update the strategy-side subportfolio ledger after a live order is accepted.
 
@@ -1060,7 +1090,8 @@ class LiveEngine:
             log.info("跳过虚拟子账户更新: %s 状态=%s", plan.security, status)
             return False
         if status not in {"filled", "partly_canceled"}:
-            log.info("跳过虚拟子账户更新: %s 状态=%s，等待后续成交回报", plan.security, status or "unknown")
+            if log_waiting:
+                log.info("跳过虚拟子账户更新: %s 状态=%s，等待后续成交回报", plan.security, status or "unknown")
             return False
 
         sp = self._get_subportfolio(plan.pindex)
@@ -1386,7 +1417,7 @@ class LiveEngine:
             return
         assert self._loop is not None
         try:
-            await self._loop.run_in_executor(None, self.broker.sync_orders)
+            broker_orders = await self._loop.run_in_executor(None, self.broker.sync_orders)
         except Exception as exc:
             log.warning(f"订单同步失败，准备检查券商连接: {exc}")
             await self._reconnect_broker(f"order-sync failed: {exc}")
@@ -1396,8 +1427,21 @@ class LiveEngine:
             return
 
         dirty = False
+        stale_removed = False
+        now = datetime.now()
+        timeout_s = self._pending_order_timeout_seconds()
+        visible_order_ids = self._extract_broker_order_ids(broker_orders)
         terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "partly_canceled"}
-        for order_id, (order, plan) in list(self._pending_virtual_orders.items()):
+        for order_id, pending_value in list(self._pending_virtual_orders.items()):
+            pending = self._coerce_pending_virtual_order(order_id, pending_value)
+            if pending is None:
+                self._pending_virtual_orders.pop(order_id, None)
+                continue
+            order = pending.order
+            plan = pending.plan
+            broker_visible = visible_order_ids is not None and order_id in visible_order_ids
+            if broker_visible:
+                pending.last_seen_in_broker_orders = now
             try:
                 status_dict = await self.broker.get_order_status(order_id)
                 status_dict = status_dict or {}
@@ -1405,22 +1449,172 @@ class LiveEngine:
                 log.debug(f"同步待确认订单状态失败: order_id={order_id}, err={exc}")
                 continue
 
-            status_text = str(status_dict.get("status", getattr(order, "status", "")) or "").lower()
+            has_status_snapshot = bool(status_dict)
+            if has_status_snapshot:
+                status_text = self._status_to_text(status_dict.get("status", getattr(order, "status", "")))
+                pending.last_status = status_text
+                pending.last_status_at = now
+            else:
+                status_text = self._status_to_text(pending.last_status or getattr(order, "status", ""))
             if status_text:
                 order.status = status_text
-            if self._apply_virtual_order_fill(order, plan, status_dict):
+            fill_snapshot = status_dict if has_status_snapshot else {"status": status_text}
+            log_waiting = self._should_log_pending_order_waiting(pending, now)
+            if self._apply_virtual_order_fill(order, plan, fill_snapshot, log_waiting=log_waiting):
                 dirty = True
                 self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
                 self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
                 self._pending_virtual_orders.pop(order_id, None)
             elif status_text in terminal_statuses:
                 self._pending_virtual_orders.pop(order_id, None)
+            elif (now - pending.created_at).total_seconds() >= timeout_s:
+                removed = await self._expire_pending_virtual_order(
+                    order_id,
+                    pending,
+                    broker_visible=broker_visible,
+                    has_status_snapshot=has_status_snapshot,
+                    status_text=status_text,
+                    elapsed_s=(now - pending.created_at).total_seconds(),
+                )
+                stale_removed = stale_removed or removed
 
-        if dirty:
+        if stale_removed:
+            try:
+                self.refresh_account_snapshot(force=True, reconcile_cash=False)
+            except Exception as exc:
+                log.debug(f"清理超时待确认订单后刷新账户快照失败: {exc}")
+
+        if dirty or stale_removed:
             try:
                 save_g()
             except Exception as exc:
                 log.debug(f"订单同步后保存运行态失败: {exc}")
+
+    def _coerce_pending_virtual_order(
+        self,
+        order_id: str,
+        pending_value: Any,
+    ) -> Optional[_PendingVirtualOrder]:
+        if isinstance(pending_value, _PendingVirtualOrder):
+            return pending_value
+        try:
+            order, plan = pending_value
+        except Exception:
+            log.warning("无法解析待确认订单: order_id=%s, value=%r", order_id, pending_value)
+            return None
+        return _PendingVirtualOrder(order=order, plan=plan, created_at=datetime.now())
+
+    def _status_to_text(self, raw_status: Any) -> str:
+        if isinstance(raw_status, OrderStatus):
+            return raw_status.value
+        return str(raw_status or "").lower()
+
+    def _pending_order_timeout_seconds(self) -> float:
+        default_s = max(60, int(getattr(self.config, "trade_max_wait_time", 16) or 16) * 3)
+        try:
+            value = float(self._config_value("pending_order_timeout", default_s))
+        except Exception:
+            value = float(default_s)
+        return max(5.0, value)
+
+    def _extract_broker_order_ids(self, orders_snapshot: Any) -> Optional[Set[str]]:
+        if orders_snapshot is None:
+            return None
+        if isinstance(orders_snapshot, dict):
+            nested = orders_snapshot.get("orders")
+            if nested is None:
+                nested = orders_snapshot.get("value")
+            if isinstance(nested, (list, tuple)):
+                items = list(nested)
+            else:
+                items = [orders_snapshot]
+        else:
+            try:
+                items = list(orders_snapshot)
+            except Exception:
+                return None
+
+        ids: Set[str] = set()
+        id_keys = ("order_id", "orderId", "entrust_id", "entrust_no", "order_no", "order_sysid", "id")
+        for item in items:
+            oid = None
+            if isinstance(item, dict):
+                for key in id_keys:
+                    if item.get(key):
+                        oid = item.get(key)
+                        break
+            else:
+                for key in id_keys:
+                    if hasattr(item, key):
+                        oid = getattr(item, key)
+                        if oid:
+                            break
+            if oid:
+                ids.add(str(oid))
+        return ids
+
+    def _should_log_pending_order_waiting(self, pending: _PendingVirtualOrder, now: datetime) -> bool:
+        interval_s = max(30.0, float(self.config.order_sync_interval or 10) * 6)
+        if pending.last_open_log_at is None:
+            pending.last_open_log_at = now
+            return True
+        if (now - pending.last_open_log_at).total_seconds() >= interval_s:
+            pending.last_open_log_at = now
+            return True
+        return False
+
+    async def _expire_pending_virtual_order(
+        self,
+        order_id: str,
+        pending: _PendingVirtualOrder,
+        *,
+        broker_visible: bool,
+        has_status_snapshot: bool,
+        status_text: str,
+        elapsed_s: float,
+    ) -> bool:
+        cancel_ok = False
+        cancel_error: Optional[Exception] = None
+        if self.broker:
+            try:
+                cancel_ok = bool(await self.broker.cancel_order(order_id))
+            except Exception as exc:
+                cancel_error = exc
+
+        if broker_visible and not cancel_ok:
+            if cancel_error is not None:
+                log.warning(
+                    "待确认订单超时但撤单失败，继续保留: order_id=%s, stock=%s, status=%s, elapsed=%.1fs, err=%s",
+                    order_id,
+                    pending.plan.security,
+                    status_text or "unknown",
+                    elapsed_s,
+                    cancel_error,
+                )
+            else:
+                log.warning(
+                    "待确认订单超时但券商仍可见且撤单未成功，继续保留: order_id=%s, stock=%s, status=%s, elapsed=%.1fs",
+                    order_id,
+                    pending.plan.security,
+                    status_text or "unknown",
+                    elapsed_s,
+                )
+            return False
+
+        pending.order.status = "canceled"
+        self._pending_virtual_orders.pop(order_id, None)
+        reason = "券商订单列表不可见" if not broker_visible else "撤单成功"
+        if not has_status_snapshot:
+            reason += ", 状态快照为空"
+        log.warning(
+            "待确认订单超时，已移除本地pending且不更新虚拟持仓: order_id=%s, stock=%s, status=%s, elapsed=%.1fs, reason=%s",
+            order_id,
+            pending.plan.security,
+            status_text or "unknown",
+            elapsed_s,
+            reason,
+        )
+        return True
 
     async def _risk_step(self) -> None:
         try:
