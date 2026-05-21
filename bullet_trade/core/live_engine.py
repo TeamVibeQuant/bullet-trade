@@ -274,6 +274,7 @@ class LiveEngine:
         self._instance_lock: Optional[ManagedLiveLock] = None
         self._subportfolios_restored: bool = False
         self._pending_virtual_orders: Dict[str, _PendingVirtualOrder] = {}
+        self._active_order_submissions: int = 0
         self._suppress_cash_reconcile_until: Optional[datetime] = None
         self._suppress_position_sync_until: Optional[datetime] = None
 
@@ -751,6 +752,7 @@ class LiveEngine:
                     except Exception:
                         pass
                     continue
+                order_submission_active = False
                 try:
                     price_basis = plan.price if plan.price and plan.price > 0 else plan.last_price
                     order_value = float(plan.amount * max(price_basis, 0.0))
@@ -809,6 +811,8 @@ class LiveEngine:
                     order.action = 'open' if plan.is_buy else 'close'
                     order.value = order_value
                     order.price = price_value
+                    self._active_order_submissions += 1
+                    order_submission_active = True
                     if plan.is_buy:
                         order_id = await self.broker.buy(
                             plan.security,
@@ -895,7 +899,10 @@ class LiveEngine:
                                 last_status=status_text,
                                 last_status_at=datetime.now() if status_text else None,
                             )
-                    if risk:
+                    recordable_status = self._status_to_text(
+                        (status_dict or {}).get("status", getattr(order, "status", ""))
+                    )
+                    if risk and recordable_status not in {"rejected", "canceled", "cancelled"}:
                         try:
                             risk.record_trade(order_value, action=action)
                         except Exception as record_exc:
@@ -922,6 +929,9 @@ class LiveEngine:
                         order.status = OrderStatus.rejected
                     except Exception:
                         pass
+                finally:
+                    if order_submission_active:
+                        self._active_order_submissions = max(0, self._active_order_submissions - 1)
             order_snapshots: List[Dict[str, Any]] = []
             trade_snapshots: List[Dict[str, Any]] = []
             try:
@@ -3787,6 +3797,12 @@ class LiveEngine:
         if self._suppress_cash_reconcile_until and datetime.now() < self._suppress_cash_reconcile_until:
             log.debug("刚完成虚拟成交更新，跳过本轮多子账户现金对账")
             return False
+        if self._active_order_submissions > 0:
+            log.debug("存在正在等待回报的券商订单，跳过本轮多子账户现金对账")
+            return False
+        if self._pending_virtual_orders:
+            log.debug("存在未确认券商订单，跳过本轮多子账户现金对账")
+            return False
         subs = getattr(target, "subportfolios", {}) or {}
         if len(subs) <= 1:
             return False
@@ -3935,6 +3951,9 @@ class LiveEngine:
                     cash_reconciled = False
                 elif self._pending_virtual_orders:
                     log.debug("存在未确认券商订单，跳过本轮多子账户现金对账")
+                    cash_reconciled = False
+                elif self._active_order_submissions > 0:
+                    log.debug("存在正在等待回报的券商订单，跳过本轮多子账户现金对账")
                     cash_reconciled = False
                 else:
                     cash_reconciled = self._reconcile_subportfolio_cash(

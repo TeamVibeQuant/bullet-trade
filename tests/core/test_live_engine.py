@@ -3030,6 +3030,50 @@ def test_account_snapshot_refreshes_virtual_subportfolio_costs(tmp_path):
     assert pos1.value == pytest.approx(390.0)
 
 
+def test_account_snapshot_skips_cash_reconcile_while_order_submission_active(tmp_path):
+    from bullet_trade.core.settings import get_settings, set_option
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[0] = SubPortfolio(type="stock", available_cash=1000.0, total_value=1000.0)
+    engine._portfolio.subportfolios[1] = SubPortfolio(type="stock", available_cash=2000.0, total_value=2000.0)
+    engine._active_order_submissions = 1
+
+    settings = get_settings()
+    old_ratios = settings.options.get("subportfolio_external_cash_sync_ratios")
+    try:
+        set_option("subportfolio_external_cash_sync_ratios", {0: 0.0, 1: 1.0})
+        engine._apply_account_snapshot(
+            {
+                "available_cash": 1500.0,
+                "total_value": 3000.0,
+                "positions": [],
+            }
+        )
+    finally:
+        engine._active_order_submissions = 0
+        if old_ratios is None:
+            settings.options.pop("subportfolio_external_cash_sync_ratios", None)
+        else:
+            set_option("subportfolio_external_cash_sync_ratios", old_ratios)
+
+    assert engine._portfolio.subportfolios[0].available_cash == pytest.approx(1000.0)
+    assert engine._portfolio.subportfolios[1].available_cash == pytest.approx(2000.0)
+
+
 @pytest.mark.asyncio
 async def test_process_orders_runs_once_with_lock(monkeypatch, tmp_path):
     strategy = _write_strategy(tmp_path)
