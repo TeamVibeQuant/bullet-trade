@@ -1994,6 +1994,7 @@ class MiniQMTProvider(DataProvider):
         xt = self._ensure_xtdata()
         code = self._normalize_security_code(security)
         try:
+            log.info(f"QMT get_live_current: 获取 {code} 的实时数据")
             tick_map = xt.get_full_tick([code])
             t = tick_map.get(code) if isinstance(tick_map, dict) else None
             if not t or t.get("lastPrice") is None:
