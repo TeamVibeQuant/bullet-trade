@@ -758,6 +758,71 @@ async def test_live_order_updates_virtual_subportfolio_by_pindex(monkeypatch, tm
 
 
 @pytest.mark.asyncio
+async def test_live_buy_amount_caps_to_available_cash_with_market_high_limit(monkeypatch, tmp_path):
+    class FilledNoSyncBroker(DummyBroker):
+        def supports_account_sync(self) -> bool:
+            return False
+
+        async def get_order_status(self, order_id: str):
+            return {"order_id": order_id, "status": "filled", "price": 14.64}
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=FilledNoSyncBroker,
+        live_config=cfg,
+    )
+    engine.broker = FilledNoSyncBroker()
+    engine._risk = None
+    initial_cash = 149_062.57
+    engine._portfolio.subportfolios.clear()
+    engine._portfolio.subportfolios[1] = SubPortfolio(
+        type="stock",
+        available_cash=initial_cash,
+        transferable_cash=initial_cash,
+        total_value=initial_cash,
+    )
+    engine._portfolio.update_value()
+
+    class Snap:
+        paused = False
+        last_price = 14.43
+        high_limit = 15.95
+        low_limit = 12.99
+
+    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"002601.XSHE": Snap()})
+
+    clear_order_queue()
+    order_target_value("002601.XSHE", 141_962.68, pindex=1)
+    await engine._process_orders(engine.context.current_dt)
+
+    assert len(engine.broker.orders) == 1
+    security, amount, price, side, market = engine.broker.orders[0]
+    assert (security, side, market) == ("002601.XSHE", "buy", True)
+    assert amount == 9300
+    assert amount * Snap.high_limit <= initial_cash
+    assert price == pytest.approx(
+        pricing.compute_market_protect_price(
+            "002601.XSHE",
+            Snap.last_price,
+            Snap.high_limit,
+            Snap.low_limit,
+            0.015,
+            True,
+        )
+    )
+
+
+@pytest.mark.asyncio
 async def test_target_zero_sell_syncs_unique_subportfolio_quantity_from_broker(monkeypatch, tmp_path):
     class PositionSyncBroker(DummyBroker):
         def __init__(self):

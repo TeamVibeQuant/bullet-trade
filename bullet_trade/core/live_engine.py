@@ -872,6 +872,20 @@ class LiveEngine:
                 log.error(f"{order.security} 无法计算保护价: {exc}")
                 return None
 
+        if is_buy:
+            amount = self._cap_buy_amount_by_available_cash(
+                order.security,
+                amount,
+                exec_price,
+                last_price,
+                getattr(snapshot, "high_limit", None),
+                is_market,
+                pindex,
+            )
+            if amount <= 0:
+                log.warning(f"{order.security} 可用资金不足以买入最小单位，忽略订单")
+                return None
+
         return _ResolvedOrder(
             order.security,
             amount,
@@ -882,6 +896,53 @@ class LiveEngine:
             getattr(order, "wait_timeout", None),
             is_market,
         )
+
+    def _cap_buy_amount_by_available_cash(
+        self,
+        security: str,
+        amount: int,
+        exec_price: Optional[float],
+        last_price: float,
+        high_limit: Optional[float],
+        is_market: bool,
+        pindex: int,
+    ) -> int:
+        """Shrink buy size so broker-side cash lock cannot exceed subportfolio cash."""
+        sp = self._get_subportfolio(pindex)
+        if sp is None:
+            cash = float(getattr(self._portfolio_backing(), "available_cash", 0.0) or 0.0)
+            locked_cash = float(getattr(self._portfolio_backing(), "locked_cash", 0.0) or 0.0)
+        else:
+            cash = float(getattr(sp, "available_cash", 0.0) or 0.0)
+            locked_cash = float(getattr(sp, "locked_cash", 0.0) or 0.0)
+        available_cash = max(0.0, cash - locked_cash)
+        if available_cash <= 0:
+            return 0
+
+        cash_price = float(exec_price or last_price or 0.0)
+        if is_market:
+            try:
+                high = float(high_limit or 0.0)
+            except Exception:
+                high = 0.0
+            if high > 0:
+                cash_price = max(cash_price, high)
+        if cash_price <= 0:
+            return amount
+
+        max_amount = int(available_cash / cash_price)
+        capped = pricing.adjust_order_amount(security, min(int(amount or 0), max_amount), True)
+        if capped < amount:
+            log.warning(
+                "%s 买入数量按可用资金收缩: %d -> %d, cash=%.2f, cash_price=%.4f, estimated_lock=%.2f",
+                security,
+                amount,
+                capped,
+                available_cash,
+                cash_price,
+                capped * cash_price,
+            )
+        return capped
 
     def _resolve_order_amount(self, order: Order, last_price: float) -> Tuple[int, bool]:
         price = last_price if last_price > 0 else 1.0
