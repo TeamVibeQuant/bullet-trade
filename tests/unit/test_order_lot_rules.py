@@ -43,3 +43,5 @@ def test_sell_odd_lot_allowed():
     assert pricing.adjust_order_amount("000001.XSHE", 20, False, closeable=20) == 20
     assert pricing.adjust_order_amount("000001.XSHE", 50, False, closeable=20) == 20
     assert pricing.adjust_order_amount("000001.XSHE", 150, False, closeable=300) == 100
+    assert pricing.adjust_order_amount("300502.XSHE", 240, False, closeable=240) == 240
+    assert pricing.adjust_order_amount("300502.XSHE", 50, False, closeable=240) == 0

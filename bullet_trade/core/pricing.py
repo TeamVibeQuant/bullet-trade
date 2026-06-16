@@ -125,9 +125,14 @@ def adjust_order_amount(
         adjusted = (raw // step) * step
         return adjusted if adjusted >= min_lot else 0
     if closeable is not None:
-        closeable = int(closeable)
+        closeable = max(0, int(closeable))
+        if closeable <= 0:
+            return 0
+        raw = min(raw, closeable)
+        if raw >= closeable:
+            return closeable
         if closeable < min_lot:
-            return min(raw, closeable)
+            return raw
     adjusted = (raw // step) * step
     if adjusted < min_lot:
         return 0
