@@ -2653,7 +2653,8 @@ class LiveEngine:
             return
         assert self._loop is not None
         try:
-            if hasattr(self.broker, "is_connected") and not self.broker.is_connected():
+            connected = self._broker_is_connected()
+            if connected is False:
                 await self._reconnect_broker("broker disconnected")
                 return
         except Exception as exc:
@@ -2663,6 +2664,16 @@ class LiveEngine:
         except Exception as exc:
             log.warning(f"券商心跳异常，准备重连: {exc}")
             await self._reconnect_broker(f"heartbeat failed: {exc}")
+
+    def _broker_is_connected(self) -> Optional[bool]:
+        if not self.broker:
+            return None
+        is_connected = getattr(self.broker, "is_connected", None)
+        if is_connected is None:
+            return None
+        if callable(is_connected):
+            return bool(is_connected())
+        return bool(is_connected)
 
     async def _reconnect_broker(self, reason: str) -> bool:
         if not self.broker:
