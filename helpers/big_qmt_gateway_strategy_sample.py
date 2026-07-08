@@ -20,6 +20,7 @@ import time
 import traceback
 import builtins
 import hashlib
+import datetime as dt
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
@@ -46,15 +47,15 @@ GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
 # Authorization: Bearer <password>.
-GATEWAY_PASSWORD = "change_me_gateway_password"
+GATEWAY_PASSWORD = "qmt_helper_gateway_password@vibe_quant"
 
 # Optional extra secret header for stronger local auth. If this no longer starts
 # with change_me, clients must send the same X-BulletTrade-Secret value.
-GATEWAY_SECRET = "change_me_hmac_secret"
+GATEWAY_SECRET = "qmt_helper_gateway_secret@vibe_quant"
 
 # QMT fund account id. Requests may override it with account_id, but setting it
 # here is the normal gateway mode. Keep placeholder in shared examples.
-ACCOUNT_ID = "change_me_account_id"
+ACCOUNT_ID = "327005547"
 
 # QMT account type used by get_trade_detail_data/passorder. Stock accounts use
 # stock; other account types must match the broker/QMT environment.
@@ -63,7 +64,7 @@ ACCOUNT_TYPE = "stock"
 # Security used when callers ask for trade days without passing a symbol.
 # MiniQMT accepts symbol-less trade-day calls; Big QMT needs a concrete symbol,
 # so use a stable liquid A-share as the equivalent market calendar anchor.
-DEFAULT_TRADE_DAYS_SECURITY = "000001.SZ"
+DEFAULT_TRADE_DAYS_SECURITY = "000300.SH"
 
 # Match MiniQMT's safety default: history reads first request QMT to prepare
 # local cache, then read local bars. Callers may pass auto_download=false only
@@ -838,6 +839,37 @@ def _qmt_period(value: Any) -> str:
     return mapping.get(text, text)
 
 
+def _qmt_history_time(value: Any, period: Any) -> str:
+    if value in (None, ""):
+        return ""
+    is_daily = str(period or "").strip().lower() in ("1d", "day", "daily")
+    if isinstance(value, dt.datetime):
+        return value.strftime("%Y%m%d" if is_daily else "%Y%m%d%H%M%S")
+    if isinstance(value, dt.date):
+        return value.strftime("%Y%m%d")
+    text = str(value).strip()
+    digits = "".join([ch for ch in text if ch.isdigit()])
+    limit = 8 if is_daily else 14
+    return digits[:limit]
+
+
+def _qmt_history_fields(fields: List[str]) -> List[str]:
+    field_map = {
+        "money": "amount",
+        "paused": "suspendFlag",
+    }
+    return [field_map.get(str(field), str(field)) for field in (fields or [])]
+
+
+def _qmt_history_response_rename(fields: List[str]) -> Dict[str, str]:
+    qmt_fields = _qmt_history_fields(fields)
+    return {
+        qmt_field: str(field)
+        for field, qmt_field in zip(fields or [], qmt_fields)
+        if str(field) != qmt_field
+    }
+
+
 def _qmt_dividend_type(value: Any) -> str:
     text = str(value or "follow").strip().lower()
     mapping = {
@@ -1001,6 +1033,18 @@ def _select_dataframe_columns(df: Any, fields: List[str]) -> Any:
     return df
 
 
+def _rename_dataframe_columns(df: Any, rename_map: Dict[str, str]) -> Any:
+    if df is None or not rename_map:
+        return df
+    try:
+        rename = getattr(df, "rename", None)
+        if callable(rename):
+            return rename(columns=rename_map)
+    except Exception:
+        pass
+    return df
+
+
 def _history_price_decimals(security: Any) -> int:
     code = str(security or "").split(".", 1)[0]
     if len(code) == 6 and code.startswith(("5", "15", "16")):
@@ -1055,6 +1099,26 @@ def _normalize_history_payload(payload: Dict[str, Any], security: Any, period: A
     result = dict(payload)
     result["records"] = normalized
     return result
+
+
+def _extract_history_payload(
+    data: Any,
+    qmt_security: str,
+    security: Any,
+    response_fields: List[str],
+    period: str,
+    rename_map: Dict[str, str],
+) -> Dict[str, Any]:
+    if isinstance(data, dict):
+        df = data.get(qmt_security)
+        if df is None and data:
+            df = list(data.values())[0]
+        df = _rename_dataframe_columns(df, rename_map)
+        df = _select_dataframe_columns(df, response_fields)
+        return _normalize_history_payload(_dataframe_to_payload(df, include_index=False), security, period)
+    data = _rename_dataframe_columns(data, rename_map)
+    data = _select_dataframe_columns(data, response_fields)
+    return _normalize_history_payload(_dataframe_to_payload(data, include_index=False), security, period)
 
 
 def _records_payload(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1312,8 +1376,8 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
 def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     downloader = _qmt_global("download_history_data")
     incrementally = payload.get("incrementally")
-    start_text = str(start or "")
-    end_text = str(end or "")
+    start_text = _qmt_history_time(start, period)
+    end_text = _qmt_history_time(end, period)
     if incrementally is None:
         downloader(qmt_security, period, start_text, end_text)
     else:
@@ -1368,10 +1432,11 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     period = _qmt_period(payload.get("frequency") or payload.get("period") or "1d")
     start = payload.get("start") or payload.get("start_date") or payload.get("start_time") or ""
     end = payload.get("end") or payload.get("end_date") or payload.get("end_time") or ""
+    qmt_start = _qmt_history_time(start, period)
+    qmt_end = _qmt_history_time(end, period)
     count = _to_int(payload.get("count"), -1)
-    dividend_type = _qmt_dividend_type(payload.get("fq") or payload.get("dividend_type"))
-    fill_data = _to_bool(payload.get("fill_data"), _to_bool(payload.get("fill_paused"), True))
-    subscribe = _to_bool(payload.get("subscribe"), False)
+    qmt_fields = _qmt_history_fields(fields)
+    response_rename = _qmt_history_response_rename(fields)
     try:
         if context_info is None:
             return _context_not_ready(payload)
@@ -1385,26 +1450,25 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
             LOGGER.exception("history auto ensure_cache failed: %s", exc)
             if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
                 return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
-        data = context_info.get_market_data_ex(
-            fields,
-            [qmt_security],
-            period=period,
-            start_time=str(start),
-            end_time=str(end),
-            count=count,
-            dividend_type=dividend_type,
-            fill_data=fill_data,
-            subscribe=subscribe,
-        )
-        if isinstance(data, dict):
-            df = data.get(qmt_security)
-            if df is None and data:
-                df = list(data.values())[0]
-            df = _select_dataframe_columns(df, fields)
-            value = _normalize_history_payload(_dataframe_to_payload(df, include_index=False), security, period)
-            return _ok(value, payload.get("request_id"))
-        data = _select_dataframe_columns(data, fields)
-        value = _normalize_history_payload(_dataframe_to_payload(data, include_index=False), security, period)
+        try:
+            data = context_info.get_market_data_ex(
+                qmt_fields,
+                [qmt_security],
+                period=period,
+                start_time=qmt_start,
+                end_time=qmt_end,
+                count=count,
+            )
+        except TypeError:
+            data = context_info.get_market_data_ex(
+                qmt_fields,
+                [qmt_security],
+                period,
+                qmt_start,
+                qmt_end,
+                count,
+            )
+        value = _extract_history_payload(data, qmt_security, security, fields, period, response_rename)
         return _ok(value, payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_market_data_ex unavailable: %s", exc)
