@@ -2148,6 +2148,46 @@ def test_apply_account_snapshot_preserves_v2_locked_cash_and_stock_subportfolio(
     assert stock_sub.positions["159915.XSHE"].total_amount == 30700
 
 
+def test_init_broker_uses_sync_account_positions(tmp_path):
+    broker = DummyBroker()
+    engine = _build_v2_live_engine(tmp_path, broker)
+
+    engine._init_broker()
+
+    assert broker.account_sync_calls == 1
+    assert "000001.XSHE" in engine.context.portfolio.positions
+    assert engine.context.portfolio.positions["000001.XSHE"].total_amount == 100
+
+
+def test_apply_account_snapshot_without_positions_preserves_existing_positions(tmp_path):
+    broker = DummyBroker()
+    engine = _build_v2_live_engine(tmp_path, broker)
+    portfolio = engine.context.portfolio
+    position = Position(
+        security="000001.XSHE",
+        total_amount=100,
+        closeable_amount=100,
+        avg_cost=10.0,
+        price=11.0,
+        value=1100.0,
+    )
+    portfolio.subportfolios[0].positions["000001.XSHE"] = position
+    portfolio.subportfolios[0].available_cash = 100.0
+    portfolio.subportfolios[0].transferable_cash = 100.0
+    portfolio.update_value()
+
+    engine._apply_account_snapshot(
+        {
+            "available_cash": 888.0,
+            "total_value": 1988.0,
+        }
+    )
+
+    assert "000001.XSHE" in portfolio.positions
+    assert portfolio.positions["000001.XSHE"].total_amount == 100
+    assert portfolio.available_cash == pytest.approx(888.0)
+
+
 @pytest.mark.asyncio
 async def test_live_engine_v2_rejected_order_releases_locked_cash(monkeypatch, tmp_path):
     client = SequencedV2Client(

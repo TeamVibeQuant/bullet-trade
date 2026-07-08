@@ -131,6 +131,33 @@ class _FakeAccount:
     m_dInstrumentValue = 78.0
 
 
+class _FakePosition:
+    def __init__(self, code="000001", exchange="SZ", volume=100, can_use=80):
+        self.m_strInstrumentID = code
+        self.m_strExchangeID = exchange
+        self.m_strInstrumentName = "Fake Position"
+        self.m_nVolume = volume
+        self.m_nCanUseVolume = can_use
+        self.m_dOpenPrice = 10.0
+        self.m_dMarketValue = 1200.0
+        self.m_dLastPrice = 12.0
+        self.m_nFrozenVolume = max(0, volume - can_use)
+
+
+class _FakePositionStatistics:
+    def __init__(self, code="000001", exchange="SZ", volume=100, can_close=0):
+        self.m_strInstrumentID = code
+        self.m_strExchangeID = exchange
+        self.m_strInstrumentName = "Fake Position"
+        self.m_nPosition = volume
+        self.m_nCanCloseVol = can_close
+        self.m_dOpenPrice = 0.0
+        self.m_dAvgPrice = 10.0
+        self.m_dMarketValue = 0.0
+        self.m_dInstrumentValue = 1200.0
+        self.m_dLastPrice = 12.0
+
+
 class _FakeOrder:
     def __init__(self, order_id, code="000001", exchange="SZ", volume=100, traded=0, remark="fake"):
         self.m_strOrderSysID = order_id
@@ -558,6 +585,82 @@ def test_big_qmt_helper_merges_order_and_trade_sources(monkeypatch):
     assert [item["order_id"] for item in orders] == ["order-qmt", "order-manual"]
     assert [item["trade_id"] for item in trades] == ["trade-qmt", "trade-manual"]
     assert orders[1]["security"] == "600000.XSHG"
+
+
+def test_big_qmt_helper_positions_fallback_to_uppercase_detail_type(monkeypatch):
+    helper = _load_helper()
+    position = _FakePosition(code="600549", exchange="SH", volume=9400, can_use=9400)
+    calls = []
+
+    def fake_getter(account_id, account_type, detail_type, *args):
+        source = args[0] if args else None
+        calls.append((detail_type, source))
+        if detail_type == "POSITION" and source == "qmt":
+            return [position]
+        return []
+
+    monkeypatch.setattr(helper, "get_trade_detail_data", fake_getter, raising=False)
+
+    response = helper._dispatch_qmt_action(
+        None,
+        "positions",
+        {"account_id": "demo", "account_type": "stock", "request_id": "r-positions"},
+    )
+
+    assert response["ok"] is True
+    positions = response["value"]["positions"]
+    assert len(positions) == 1
+    assert positions[0]["security"] == "600549.XSHG"
+    assert positions[0]["amount"] == 9400
+    assert positions[0]["closeable_amount"] == 9400
+    assert ("position", "qmt") in calls
+    assert ("POSITION", "qmt") in calls
+
+
+def test_big_qmt_helper_positions_dedupe_position_statistics(monkeypatch):
+    helper = _load_helper()
+    position = _FakePosition(code="600549", exchange="SH", volume=9400, can_use=9400)
+    statistics = _FakePositionStatistics(code="600549", exchange="SH", volume=9400, can_close=0)
+
+    def fake_getter(account_id, account_type, detail_type, *args):
+        source = args[0] if args else None
+        if detail_type == "position" and source == "qmt":
+            return [position]
+        if detail_type == "POSITION_STATISTICS" and source == "qmt":
+            return [statistics]
+        return []
+
+    monkeypatch.setattr(helper, "get_trade_detail_data", fake_getter, raising=False)
+
+    positions = helper._query_positions("demo", "stock")
+
+    assert len(positions) == 1
+    assert positions[0]["security"] == "600549.XSHG"
+    assert positions[0]["amount"] == 9400
+    assert positions[0]["closeable_amount"] == 9400
+    assert positions[0]["market_value"] == 1200.0
+
+
+def test_big_qmt_helper_positions_support_statistics_fields(monkeypatch):
+    helper = _load_helper()
+    statistics = _FakePositionStatistics(code="000657", exchange="SZ", volume=4100, can_close=0)
+
+    def fake_getter(account_id, account_type, detail_type, *args):
+        source = args[0] if args else None
+        if detail_type == "POSITION_STATISTICS" and source == "qmt":
+            return [statistics]
+        return []
+
+    monkeypatch.setattr(helper, "get_trade_detail_data", fake_getter, raising=False)
+
+    positions = helper._query_positions("demo", "stock")
+
+    assert len(positions) == 1
+    assert positions[0]["security"] == "000657.XSHE"
+    assert positions[0]["amount"] == 4100
+    assert positions[0]["closeable_amount"] == 0
+    assert positions[0]["avg_cost"] == 10.0
+    assert positions[0]["market_value"] == 1200.0
 
 
 def test_big_qmt_helper_debug_scans_trade_detail_combinations(monkeypatch):

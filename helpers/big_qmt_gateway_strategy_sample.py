@@ -1146,22 +1146,98 @@ def _account_to_dict(account: Any, account_id: str, account_type: str) -> Dict[s
     }
 
 
+def _first_attr_value(obj: Any, names: List[str]) -> Any:
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _first_float_attr(obj: Any, names: List[str], default: float = 0.0, prefer_positive: bool = False) -> float:
+    fallback = None
+    for name in names:
+        value = _first_attr_value(obj, [name])
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if prefer_positive and number <= 0:
+            if fallback is None:
+                fallback = number
+            continue
+        return number
+    if fallback is not None:
+        return float(fallback)
+    return float(default)
+
+
+def _first_int_attr(obj: Any, names: List[str], default: int = 0, prefer_positive: bool = False) -> int:
+    return int(_first_float_attr(obj, names, float(default), prefer_positive=prefer_positive) or 0)
+
+
 def _position_to_dict(position: Any) -> Dict[str, Any]:
+    amount = _first_int_attr(position, ["m_nVolume", "m_nPosition"], 0, prefer_positive=True)
+    closeable_value = _first_attr_value(position, ["m_nCanUseVolume", "m_nCanCloseVol"])
+    if closeable_value in (None, ""):
+        closeable_amount = amount
+    else:
+        try:
+            closeable_amount = int(float(closeable_value))
+        except Exception:
+            closeable_amount = 0
+    avg_cost = _first_float_attr(position, ["m_dOpenPrice", "m_dAvgPrice"], 0.0, prefer_positive=True)
+    market_value = _first_float_attr(position, ["m_dMarketValue", "m_dInstrumentValue"], 0.0, prefer_positive=True)
     return {
         "security": _security(
             getattr(position, "m_strInstrumentID", ""),
             getattr(position, "m_strExchangeID", ""),
         ),
         "name": getattr(position, "m_strInstrumentName", ""),
-        "amount": int(getattr(position, "m_nVolume", 0) or 0),
-        "closeable_amount": int(getattr(position, "m_nCanUseVolume", 0) or 0),
-        "avg_cost": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
-        "cost_basis": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
-        "market_value": float(getattr(position, "m_dMarketValue", 0.0) or 0.0),
-        "last_price": float(getattr(position, "m_dLastPrice", 0.0) or 0.0),
-        "frozen": int(getattr(position, "m_nFrozenVolume", 0) or 0),
+        "amount": amount,
+        "closeable_amount": closeable_amount,
+        "avg_cost": avg_cost,
+        "cost_basis": avg_cost,
+        "market_value": market_value,
+        "last_price": _first_float_attr(position, ["m_dLastPrice", "m_dSettlementPrice"], 0.0, prefer_positive=True),
+        "frozen": _first_int_attr(position, ["m_nFrozenVolume"], 0),
         "raw": _basic_value(position),
     }
+
+
+def _position_quality(position: Dict[str, Any]):
+    return (
+        int(position.get("amount") or 0) > 0,
+        float(position.get("market_value") or 0.0) > 0.0,
+        int(position.get("closeable_amount") or 0) > 0,
+        float(position.get("avg_cost") or 0.0) > 0.0,
+    )
+
+
+def _dedupe_positions(positions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best_by_security = {}
+    order = []
+    anonymous = []
+    for position in positions:
+        security = position.get("security") or ""
+        if not security:
+            anonymous.append(position)
+            continue
+        quality = _position_quality(position)
+        if security not in best_by_security:
+            best_by_security[security] = (quality, position)
+            order.append(security)
+        elif quality > best_by_security[security][0]:
+            best_by_security[security] = (quality, position)
+    result = list(anonymous)
+    for security in order:
+        result.append(best_by_security[security][1])
+    return result
 
 
 def _order_to_dict(order: Any) -> Dict[str, Any]:
@@ -1291,7 +1367,7 @@ def _merge_trade_detail_rows(account_id: str, account_type: str, detail_types: L
         for source in sources:
             result = _try_trade_detail(account_id, account_type, detail_type, source)
             for row in result["rows"]:
-                key = detail_type + "|" + _row_identity(row, "row")
+                key = str(detail_type).lower() + "|" + _row_identity(row, "row")
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1305,7 +1381,13 @@ def _query_account(account_id: str, account_type: str) -> Dict[str, Any]:
 
 
 def _query_positions(account_id: str, account_type: str) -> List[Dict[str, Any]]:
-    return [_position_to_dict(item) for item in _trade_detail(account_id, account_type, "position")]
+    rows = _merge_trade_detail_rows(
+        account_id,
+        account_type,
+        ["position", "POSITION", "position_statistics", "POSITION_STATISTICS"],
+        ["qmt", None],
+    )
+    return _dedupe_positions([_position_to_dict(item) for item in rows])
 
 
 def _query_orders(account_id: str, account_type: str, payload: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

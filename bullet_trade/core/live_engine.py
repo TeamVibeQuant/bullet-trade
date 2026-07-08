@@ -3958,40 +3958,44 @@ class LiveEngine:
                 target.locked_cash = float(locked)
             if total is not None:
                 target.total_value = float(total)
+            has_positions = 'positions' in snapshot
             positions = snapshot.get('positions') or []
-            target.positions.clear()
             stock_subportfolio = None
             try:
                 stock_subportfolio = target.subportfolios.get('stock')
             except Exception:
                 stock_subportfolio = None
+            if has_positions:
+                target.positions.clear()
             if stock_subportfolio is not None:
                 stock_subportfolio.available_cash = float(getattr(target, 'available_cash', 0.0) or 0.0)
                 stock_subportfolio.transferable_cash = float(getattr(target, 'transferable_cash', 0.0) or 0.0)
-                stock_subportfolio.positions.clear()
-            for item in positions:
-                security = item.get('security')
-                if not security:
-                    continue
-                amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
-                if amount <= 0:
-                    continue
-                price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
-                position = Position(
-                    security=security,
-                    total_amount=amount,
-                    closeable_amount=int(item.get('closeable_amount', amount)),
-                    avg_cost=float(item.get('avg_cost', 0.0) or 0.0),
-                    price=price,
-                    value=float(item.get('market_value', amount * price)),
-                    buy_time=self._parse_datetime_value(item.get('buy_time', item.get('init_time'))),
-                    last_buy_time=self._parse_datetime_value(
-                        item.get('last_buy_time', item.get('transact_time', item.get('buy_time', item.get('init_time'))))
-                    ),
-                )
-                target.positions[security] = position
-                if stock_subportfolio is not None:
-                    stock_subportfolio.positions[security] = position
+                if has_positions:
+                    stock_subportfolio.positions.clear()
+            if has_positions:
+                for item in positions:
+                    security = item.get('security')
+                    if not security:
+                        continue
+                    amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
+                    if amount <= 0:
+                        continue
+                    price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
+                    position = Position(
+                        security=security,
+                        total_amount=amount,
+                        closeable_amount=int(item.get('closeable_amount', amount)),
+                        avg_cost=float(item.get('avg_cost', 0.0) or 0.0),
+                        price=price,
+                        value=float(item.get('market_value', amount * price)),
+                        buy_time=self._parse_datetime_value(item.get('buy_time', item.get('init_time'))),
+                        last_buy_time=self._parse_datetime_value(
+                            item.get('last_buy_time', item.get('transact_time', item.get('buy_time', item.get('init_time'))))
+                        ),
+                    )
+                    target.positions[security] = position
+                    if stock_subportfolio is not None:
+                        stock_subportfolio.positions[security] = position
 
             # 首次连接券商时，用券商真实总资产锚定 starting_cash。
             # 必须在 update_value() 之前设置，因为 update_value 会用子账户
@@ -4014,11 +4018,13 @@ class LiveEngine:
                     sp.transferable_cash = float(cash)
                 if locked is not None:
                     sp.locked_cash = float(locked)
-                sp.positions = dict(target.positions)
+                if has_positions:
+                    sp.positions = dict(target.positions)
                 cash_reconciled = False
             else:
-                self._sync_subportfolio_positions_from_broker_snapshot(target, snapshot=snapshot)
-                self._refresh_subportfolio_prices(target, snapshot=snapshot)
+                if has_positions:
+                    self._sync_subportfolio_positions_from_broker_snapshot(target, snapshot=snapshot)
+                    self._refresh_subportfolio_prices(target, snapshot=snapshot)
                 if not reconcile_cash:
                     cash_reconciled = False
                 elif self._pending_virtual_orders:
@@ -4047,7 +4053,10 @@ class LiveEngine:
         if not self.broker:
             return {}
         try:
-            info = self.broker.get_account_info() or {}
+            if self.broker.supports_account_sync():
+                info = self.broker.sync_account() or {}
+            else:
+                info = self.broker.get_account_info() or {}
             # 如果券商返回的是自定义对象，尽量转成 dict
             if not isinstance(info, dict):
                 info = getattr(info, '__dict__', {}) or {}
