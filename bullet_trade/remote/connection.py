@@ -53,20 +53,43 @@ class RemoteQmtConnection:
         self._keepalive: float = 20.0
 
     def start(self) -> None:
-        if self._thread:
+        if self._thread and self._thread.is_alive():
+            if not self._connected.wait(timeout=10):
+                raise RuntimeError("连接 qmt server 超时")
             return
+        self._thread = None
+        self._loop = None
+        self._connected.clear()
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
         if not self._connected.wait(timeout=10):
+            self.close()
             raise RuntimeError("连接 qmt server 超时")
 
     def close(self) -> None:
         self._stop.set()
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
+        self._connected.clear()
+        if self._loop and not self._loop.is_closed():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except RuntimeError:
+                pass
+        if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
         self._thread = None
+        self._loop = None
+
+    @property
+    def is_connected(self) -> bool:
+        """返回远程连接当前是否有可用 TCP 会话。"""
+
+        return bool(
+            self._connected.is_set()
+            and not self._stop.is_set()
+            and self._thread is not None
+            and self._thread.is_alive()
+        )
 
     def add_event_listener(self, event: str, handler: Callable[[Dict[str, Any]], None]) -> None:
         self._event_handlers.setdefault(event, []).append(handler)

@@ -156,6 +156,24 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     assert recorded_future.timeouts == [60, None]
 
 
+def test_remote_connection_can_restart_after_close(stub_server):
+    """close 后同一个 RemoteQmtConnection 对象应可再次 start，用于 LiveEngine 重连。"""
+
+    conn = _make_connection(stub_server)
+    try:
+        assert conn.is_connected is True
+        assert conn.request("admin.health", {})
+        conn.close()
+        assert conn.is_connected is False
+
+        conn.start()
+
+        assert conn.is_connected is True
+        assert conn.request("admin.health", {})
+    finally:
+        conn.close()
+
+
 def test_server_session_extends_place_order_timeout_for_long_wait():
     """broker.place_order 长等待窗口应同步扩展 session 外层请求超时。"""
 

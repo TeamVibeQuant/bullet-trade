@@ -131,14 +131,39 @@ class RemoteQmtBroker(BrokerBase):
         )
 
     def connect(self) -> bool:
-        self._connection.start()
-        self._connected = True
+        try:
+            self._connection.start()
+        except Exception:
+            self._connected = False
+            raise
+        self._connected = self._connection_is_connected()
         return True
 
     def disconnect(self) -> bool:
         self._connected = False
         self._connection.close()
         return True
+
+    @property
+    def is_connected(self) -> bool:
+        """返回远程 QMT broker 当前是否仍有可用连接。"""
+
+        return bool(self._connected and self._connection_is_connected())
+
+    def heartbeat(self) -> None:
+        """检查远程连接是否仍可用，异常由 LiveEngine 捕获后触发重连。"""
+
+        if not self.is_connected:
+            self._connected = False
+            raise RuntimeError("QMT remote 连接已断开")
+
+    def _connection_is_connected(self) -> bool:
+        state = getattr(self._connection, "is_connected", None)
+        if state is None:
+            return True
+        if callable(state):
+            return bool(state())
+        return bool(state)
 
     def get_account_info(self) -> Dict[str, Any]:
         payload = self._base_payload()

@@ -90,6 +90,32 @@ class _OrderListConn(_FakeConn):
         return dict(self.response)
 
 
+class _StatefulConn(_FakeConn):
+    """可切换连接状态的测试连接桩。"""
+
+    def __init__(self):
+        """初始化为未连接状态。"""
+
+        super().__init__()
+        self.connected = False
+
+    @property
+    def is_connected(self):
+        """返回当前模拟连接状态。"""
+
+        return self.connected
+
+    def start(self):
+        """模拟连接启动成功。"""
+
+        self.connected = True
+
+    def close(self):
+        """模拟连接关闭。"""
+
+        self.connected = False
+
+
 def test_remote_warning_prints_and_captures(capsys, monkeypatch):
     """远程 warning 应打印到 stdout 并保存到 broker 最近 warning。"""
 
@@ -101,6 +127,26 @@ def test_remote_warning_prints_and_captures(capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "停牌" in out
     assert broker._last_warning and "停牌" in broker._last_warning
+
+
+def test_remote_qmt_broker_connection_state_and_heartbeat(monkeypatch):
+    """broker 连接状态应跟随底层远程连接，断线时 heartbeat 触发重连链路。"""
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    fake_conn = _StatefulConn()
+    broker._connection = fake_conn  # type: ignore
+
+    broker.connect()
+    assert broker.is_connected is True
+    broker.heartbeat()
+
+    fake_conn.connected = False
+
+    assert broker.is_connected is False
+    with pytest.raises(RuntimeError, match="QMT remote 连接已断开"):
+        broker.heartbeat()
+    assert broker._connected is False
 
 
 def test_remote_qmt_broker_market_order_without_price_does_not_prefill_protect_price(monkeypatch):
