@@ -77,6 +77,7 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["backend_type"] == "big_qmt"
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
+    assert health["qmt"]["actions"]["data.batch_get_live_current"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
     assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
     assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
@@ -88,9 +89,9 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
         {
             "/data/history": {"records": [{"open": 1.0, "close": 2.0}]},
             "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000, "bidPrice": [12.2]}}},
-            "/data/live_current": {
+            "/data/live_current": lambda payload: {
                 "ticks": {
-                    "000001.XSHE": {
+                    payload.get("security", "000001.XSHE"): {
                         "lastPrice": 12.5,
                         "high_limit": 13.75,
                         "low_limit": 11.25,
@@ -124,6 +125,23 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
         "high_limit": 13.75,
         "low_limit": 11.25,
         "paused": False,
+    }
+    batch_current = await adapter.batch_get_live_current({"securities": "000001.XSHE,000002.XSHE"})
+    assert batch_current == {
+        "value": {
+            "000001.XSHE": {
+                "last_price": 12.5,
+                "high_limit": 13.75,
+                "low_limit": 11.25,
+                "paused": False,
+            },
+            "000002.XSHE": {
+                "last_price": 12.5,
+                "high_limit": 13.75,
+                "low_limit": 11.25,
+                "paused": False,
+            },
+        }
     }
 
     current_tick = await adapter.get_current_tick("000001.XSHE")

@@ -663,6 +663,60 @@ def test_remote_data_provider_security_info_supports_flat_response():
     assert info["type"] == "etf"
 
 
+def test_remote_data_provider_live_current_uses_server_action():
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+
+    class _FakeConnection:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, action, payload):
+            self.calls.append((action, payload))
+            assert action == "data.live_current"
+            return {"value": {"last_price": 12.3, "high_limit": 13.5, "low_limit": 11.1, "paused": False}}
+
+    conn = _FakeConnection()
+    provider._connection = conn
+
+    snap = provider.get_live_current("000001.XSHE")
+
+    assert snap["last_price"] == 12.3
+    assert conn.calls == [("data.live_current", {"security": "000001.XSHE"})]
+
+
+def test_remote_data_provider_batch_live_current_uses_server_action():
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+
+    class _FakeConnection:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, action, payload):
+            self.calls.append((action, payload))
+            assert action == "data.batch_get_live_current"
+            return {
+                "value": {
+                    "000001.XSHE": {"last_price": 12.3},
+                    "600000.XSHG": {"last_price": 9.8},
+                }
+            }
+
+    conn = _FakeConnection()
+    provider._connection = conn
+
+    snaps = provider.batch_get_live_current(["000001.XSHE", "600000.XSHG"])
+
+    assert snaps["000001.XSHE"]["last_price"] == 12.3
+    assert snaps["600000.XSHG"]["last_price"] == 9.8
+    assert conn.calls == [
+        ("data.batch_get_live_current", {"securities": "000001.XSHE,600000.XSHG"})
+    ]
+
+
 @pytest.mark.asyncio
 async def test_remote_qmt_broker_full_flow(stub_server):
     account_key = stub_server.accounts[0].key if stub_server.accounts else "default"

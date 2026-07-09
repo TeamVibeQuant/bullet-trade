@@ -29,6 +29,7 @@ _DATA_ACTIONS = (
     "data.snapshot",
     "data.current_tick",
     "data.live_current",
+    "data.batch_get_live_current",
     "data.trade_days",
     "data.security_info",
     "data.ensure_cache",
@@ -291,6 +292,15 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         security = payload.get("security")
         data = await self.client.post_first(("/data/live_current", "/data/current_tick", "/data/snapshot"), payload)
         return _normalize_live_current_tick(_select_tick(data, security))
+
+    async def batch_get_live_current(self, payload: Dict) -> Dict:
+        securities = payload.get("securities") or payload.get("symbols") or []
+        if isinstance(securities, str):
+            securities = [item.strip() for item in securities.split(",") if item.strip()]
+        results = {}
+        for security in securities:
+            results[str(security)] = await self.get_live_current({"security": str(security)})
+        return {"value": results}
 
     async def get_trade_days(self, payload: Dict) -> Dict:
         data = await self.client.post("/data/trade_days", payload)

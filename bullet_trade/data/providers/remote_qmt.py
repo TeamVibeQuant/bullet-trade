@@ -96,6 +96,15 @@ def _parse_legacy_tuple_columns(columns):
     return pd.MultiIndex.from_tuples(parsed) if parsed else columns
 
 
+def _dict_from_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    value = payload.get("value")
+    if isinstance(value, dict):
+        return value
+    return dict(payload)
+
+
 class RemoteQmtProvider(DataProvider):
     """
     通过 TCP 远程访问 bullet-trade server 的数据提供者。
@@ -204,8 +213,16 @@ class RemoteQmtProvider(DataProvider):
     
     def batch_get_live_current(self, securities: List[str]):
         payload = {"securities": ",".join(securities)}
-        resp = self._connection.request("data.batch_get_live_current", payload)
-        return resp.get("value") or {}
+        try:
+            resp = self._connection.request("data.batch_get_live_current", payload)
+            return _dict_from_payload(resp)
+        except Exception:
+            return {security: self.get_live_current(security) for security in securities}
+
+    def get_live_current(self, security: str) -> Dict[str, Any]:
+        payload = {"security": security}
+        resp = self._connection.request("data.live_current", payload)
+        return _dict_from_payload(resp)
 
     def get_split_dividend(
         self,
