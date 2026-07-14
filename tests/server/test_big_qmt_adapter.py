@@ -234,6 +234,8 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
                         "m_nVolume": 1000,
                         "m_nCanUseVolume": 800,
                         "m_dOpenPrice": 2.5,
+                        "last_price": 2.6,
+                        "market_value": 2600.0,
                     }
                 ]
             },
@@ -284,6 +286,8 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
     assert positions[0]["security"] == "510050.XSHG"
     assert positions[0]["amount"] == 1000
     assert positions[0]["closeable_amount"] == 800
+    assert positions[0]["current_price"] == 2.6
+    assert positions[0]["last_price"] == 2.6
 
     orders = await adapter.list_orders(ctx, {"order_id": "O1"})
     assert orders[0]["status"] == "filled"

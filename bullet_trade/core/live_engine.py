@@ -2894,10 +2894,8 @@ class LiveEngine:
             amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
             if amount <= 0:
                 continue
-            price = self._to_float(item.get("current_price", item.get("price")), default=0.0)
+            price = self._position_snapshot_price(item, amount=amount)
             market_value = self._to_float(item.get("market_value"), default=0.0)
-            if price <= 0 and market_value > 0:
-                price = market_value / amount
             positions[security] = Position(
                 security=security,
                 total_amount=amount,
@@ -3117,12 +3115,8 @@ class LiveEngine:
             avg_cost = self._to_float(item.get("avg_cost"), default=0.0)
             if avg_cost > 0:
                 avg_cost_map[security] = avg_cost
-            price = self._to_float(item.get("current_price", item.get("price")), default=0.0)
-            if price <= 0:
-                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
-                market_value = self._to_float(item.get("market_value"), default=0.0)
-                if amount > 0 and market_value > 0:
-                    price = market_value / amount
+            amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+            price = self._position_snapshot_price(item, amount=amount)
             if price > 0:
                 price_map[security] = price
 
@@ -3980,14 +3974,15 @@ class LiveEngine:
                     amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
                     if amount <= 0:
                         continue
-                    price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
+                    price = self._position_snapshot_price(item, amount=amount)
+                    market_value = self._to_float(item.get('market_value'), default=0.0)
                     position = Position(
                         security=security,
                         total_amount=amount,
                         closeable_amount=int(item.get('closeable_amount', amount)),
                         avg_cost=float(item.get('avg_cost', 0.0) or 0.0),
                         price=price,
-                        value=float(item.get('market_value', amount * price)),
+                        value=market_value if market_value > 0 else amount * price,
                         buy_time=self._parse_datetime_value(item.get('buy_time', item.get('init_time'))),
                         last_buy_time=self._parse_datetime_value(
                             item.get('last_buy_time', item.get('transact_time', item.get('buy_time', item.get('init_time'))))
@@ -4084,13 +4079,14 @@ class LiveEngine:
                     continue
                 closeable = int(item.get('closeable_amount', amount) or amount)
                 avg_cost = self._to_float(item.get('avg_cost'))
-                price = self._to_float(item.get('current_price', item.get('price')))
+                price = self._position_snapshot_price(item, amount=amount)
                 value = self._to_float(item.get('market_value'), default=price * amount)
                 if value == 0.0:
                     value = price * amount
                 invested += value
-                pnl = value - avg_cost * amount
-                pnl_pct = ((price / avg_cost - 1.0) * 100.0) if avg_cost > 0 else 0.0
+                cost_value = avg_cost * amount
+                pnl = value - cost_value
+                pnl_pct = (pnl / cost_value * 100.0) if cost_value > 0 else 0.0
                 weight = ((value / total_value) * 100.0) if total_value > 0 else 0.0
                 name = item.get('display_name') or item.get('name') or self._lookup_security_name(code)
                 entries.append(
@@ -4199,6 +4195,46 @@ class LiveEngine:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @classmethod
+    def _position_snapshot_price(
+        cls,
+        item: Dict[str, Any],
+        amount: Optional[int] = None,
+    ) -> float:
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        for candidate in (
+            item.get("current_price"),
+            item.get("price"),
+            item.get("last_price"),
+            item.get("lastPrice"),
+            item.get("last"),
+            item.get("m_dLastPrice"),
+            raw.get("m_dLastPrice"),
+            raw.get("m_dSettlementPrice"),
+            raw.get("m_dLastSettlementPrice"),
+        ):
+            price = cls._to_float(candidate, default=0.0)
+            if price > 0:
+                return price
+
+        resolved_amount = amount
+        if resolved_amount is None:
+            resolved_amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+        market_value = cls._to_float(item.get("market_value"), default=0.0)
+        if market_value <= 0:
+            for candidate in (
+                item.get("m_dMarketValue"),
+                item.get("m_dInstrumentValue"),
+                raw.get("m_dMarketValue"),
+                raw.get("m_dInstrumentValue"),
+            ):
+                market_value = cls._to_float(candidate, default=0.0)
+                if market_value > 0:
+                    break
+        if resolved_amount and resolved_amount > 0 and market_value > 0:
+            return market_value / resolved_amount
+        return 0.0
 
     @staticmethod
     def _display_width(text: str) -> int:

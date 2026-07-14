@@ -1020,6 +1020,7 @@ def _order_matches_place_request_relaxed(order: Dict[str, Any], request: Dict[st
 
 def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
     item = dict(row)
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
     security = item.get("security") or _security_from_qmt_fields(item)
     if security:
         item["security"] = security
@@ -1029,6 +1030,35 @@ def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
         item["amount"] = item.get("volume") or item.get("m_nVolume")
     if "cost_basis" not in item:
         item["cost_basis"] = item.get("avg_cost") or item.get("m_dOpenPrice")
+
+    current_price = None
+    for value in (
+        item.get("current_price"),
+        item.get("price"),
+        item.get("last_price"),
+        item.get("lastPrice"),
+        item.get("m_dLastPrice"),
+        raw.get("m_dLastPrice"),
+        raw.get("m_dSettlementPrice"),
+    ):
+        parsed = _as_float_or_none(value)
+        if parsed is not None and parsed > 0:
+            current_price = parsed
+            break
+    if current_price is None:
+        amount = _to_int(item.get("amount")) or 0
+        market_value = _as_float_or_none(
+            item.get("market_value")
+            or item.get("m_dMarketValue")
+            or raw.get("m_dMarketValue")
+            or raw.get("m_dInstrumentValue")
+        )
+        if amount > 0 and market_value is not None and market_value > 0:
+            current_price = market_value / amount
+    if current_price is not None:
+        item["current_price"] = current_price
+        if _as_float_or_none(item.get("last_price")) in (None, 0.0):
+            item["last_price"] = current_price
     return item
 
 
