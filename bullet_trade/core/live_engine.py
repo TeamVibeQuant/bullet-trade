@@ -265,7 +265,6 @@ class LiveEngine:
         self._trades: Dict[str, Trade] = {}
         self._broker_order_index: Dict[str, str] = {}
         self._order_snapshot_debug_signatures: Dict[str, Tuple[Any, ...]] = {}
-        self._last_subportfolio_refresh_log: Optional[datetime] = None
         self._calendar_guard = TradingCalendarGuard(self.config)
         self._initial_nav_synced: bool = False
         self._provider_tick_callback_bound: bool = False
@@ -3016,11 +3015,6 @@ class LiveEngine:
         }
 
         changed = False
-        updated = 0
-        added = 0
-        removed = 0
-        skipped_multi_owner = 0
-
         for security, broker_pos in broker_positions.items():
             owners = self._position_owner_indices(backing, security)
             if len(owners) == 1:
@@ -3030,12 +3024,10 @@ class LiveEngine:
                     continue
                 _, _, pos_changed = self._apply_broker_position_to_virtual(pos, broker_pos)
                 if pos_changed:
-                    updated += 1
                     changed = True
                 sp.update_value()
                 continue
             if len(owners) > 1:
-                skipped_multi_owner += 1
                 continue
 
             idx = self._select_subportfolio_for_broker_only_position(backing, security)
@@ -3053,7 +3045,6 @@ class LiveEngine:
                 side=getattr(broker_pos, "side", "long"),
             )
             sp.update_value()
-            added += 1
             changed = True
             if log_broker_only_recovery:
                 log.warning("券商持仓未在子账户快照中找到，已恢复到子账户[%s]: %s", idx, security)
@@ -3066,8 +3057,6 @@ class LiveEngine:
                 continue
             owners = self._position_owner_indices(backing, security)
             if len(owners) != 1:
-                if len(owners) > 1:
-                    skipped_multi_owner += 1
                 continue
             idx = owners[0]
             sp = subs.get(idx)
@@ -3075,20 +3064,11 @@ class LiveEngine:
                 continue
             sp.positions.pop(security, None)
             sp.update_value()
-            removed += 1
             changed = True
             log.warning("券商账户已无该持仓，已从子账户[%s]快照移除: %s", idx, security)
 
         if changed:
             backing.update_value()
-        if changed or (force_log and skipped_multi_owner):
-            log.info(
-                "同步券商持仓到子账户: 更新%d只, 新增%d只, 移除%d只, 多归属跳过%d只",
-                updated,
-                added,
-                removed,
-                skipped_multi_owner,
-            )
         return changed
 
     def _refresh_subportfolio_prices(
@@ -3141,9 +3121,6 @@ class LiveEngine:
                 price_map[security] = price
 
         if not price_map and not avg_cost_map:
-            if force_log:
-                log.info("刷新子账户持仓成本价/实时价格: %d 条", 0)
-                self._last_subportfolio_refresh_log = datetime.now()
             return False
 
         refreshed = 0
@@ -3162,12 +3139,6 @@ class LiveEngine:
                 if changed:
                     refreshed += 1
 
-        if refreshed or force_log:
-            now = datetime.now()
-            last_log = self._last_subportfolio_refresh_log
-            if force_log or last_log is None or (now - last_log).total_seconds() >= 300:
-                log.info("刷新子账户持仓成本价/实时价格: %d 条", refreshed)
-                self._last_subportfolio_refresh_log = now
         return refreshed > 0
 
     def _refresh_subportfolio_snapshot_for_save(self, force_log: bool = False) -> bool:

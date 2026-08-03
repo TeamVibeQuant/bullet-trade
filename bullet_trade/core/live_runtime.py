@@ -28,9 +28,27 @@ _state_cache: Optional[Dict[str, Any]] = None
 _state_lock = threading.Lock()
 _restored_from_disk = False
 
+_SAVE_SUCCESS_LOG_INTERVAL_SECONDS = 60 * 60
+_save_success_log_times: Dict[str, float] = {}
+_save_success_log_lock = threading.Lock()
+
 # 子账户持久化：由 LiveEngine 注册 portfolio 引用，save_g 时自动保存
 _portfolio_ref: Any = None
 _portfolio_price_refresher: Optional[Callable[..., bool]] = None
+
+
+def _log_save_success(log_key: str, message: str) -> None:
+    """首次保存成功立即记录，之后同类日志每小时最多输出一次。"""
+    now = time.monotonic()
+    with _save_success_log_lock:
+        last_log_at = _save_success_log_times.get(log_key)
+        if (
+            last_log_at is not None
+            and now - last_log_at < _SAVE_SUCCESS_LOG_INTERVAL_SECONDS
+        ):
+            return
+        _save_success_log_times[log_key] = now
+    log.info(message)
 
 
 def _g_path() -> str:
@@ -91,6 +109,8 @@ def init_live_runtime(runtime_dir: str) -> None:
     _restored_from_disk = False
     _portfolio_ref = None
     _portfolio_price_refresher = None
+    with _save_success_log_lock:
+        _save_success_log_times.clear()
     # 加载 g
     try:
         path = _g_path()
@@ -121,7 +141,7 @@ def save_g() -> None:
         with open(tmp, 'wb') as f:
             pickle.dump(getattr(g, '_data', {}), f, protocol=pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, _g_path())
-        log.info(f'🛟 已保存 g 到 {_g_path()}')
+        _log_save_success('g', f'🛟 已保存 g 到 {_g_path()}')
 
     except Exception as e:
         log.error(f'🛟 保存 g 失败: {e}')
@@ -330,7 +350,10 @@ def save_subportfolios() -> None:
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
         os.replace(tmp, _subportfolios_path())
-        log.info(f'🛟 已保存子账户快照到 {_subportfolios_path()}')
+        _log_save_success(
+            'subportfolios',
+            f'🛟 已保存子账户快照到 {_subportfolios_path()}',
+        )
     except Exception as e:
         log.error(f'🛟 保存子账户快照失败: {e}')
 
