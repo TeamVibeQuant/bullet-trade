@@ -21,6 +21,7 @@ import hashlib
 import inspect
 import unicodedata
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import pandas as pd
 
@@ -99,6 +100,7 @@ from .engine import PRE_MARKET_OFFSET, BacktestEngine
 from . import pricing
 
 POST_MARKET_OFFSET = timedelta(minutes=31)
+_MINUTE_WAIT_LOG_INTERVAL_SECONDS = 60 * 60
 
 
 @dataclass
@@ -248,6 +250,7 @@ class LiveEngine:
         self._post_close_dt: Optional[datetime] = None
         self._markers_fired: Set[str] = set()
         self._last_schedule_dt: Optional[datetime] = None
+        self._last_minute_wait_log_at: Optional[float] = None
         self._trade_calendar: Dict[date, Dict[str, Any]] = {}
         self._strategy_start_date: Optional[date] = None
 
@@ -611,11 +614,18 @@ class LiveEngine:
         if self._last_schedule_dt and scheduled <= self._last_schedule_dt:
             scheduled = self._last_schedule_dt + timedelta(minutes=1)
         if scheduled > current_minute:
-            log.debug(
-                "LiveEngine: 已执行至 %s，等待下一触发分钟 %s",
-                self._last_schedule_dt,
-                scheduled,
-            )
+            now = _monotonic()
+            last_log_at = self._last_minute_wait_log_at
+            if (
+                last_log_at is None
+                or now - last_log_at >= _MINUTE_WAIT_LOG_INTERVAL_SECONDS
+            ):
+                self._last_minute_wait_log_at = now
+                log.debug(
+                    "LiveEngine: 已执行至 %s，等待下一触发分钟 %s",
+                    self._last_schedule_dt,
+                    scheduled,
+                )
             return
 
         delay = (wall_clock - scheduled).total_seconds()

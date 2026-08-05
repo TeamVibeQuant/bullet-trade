@@ -13,9 +13,12 @@ from collections import defaultdict
 from enum import IntEnum
 import logging
 import inspect
+from time import monotonic as _monotonic
 
 
 logger = logging.getLogger(__name__)
+
+_NO_SUBSCRIBER_LOG_INTERVAL_SECONDS = 60 * 60
 
 
 class EventPriority(IntEnum):
@@ -126,6 +129,19 @@ class EventBus:
             'callbacks_executed': 0,
             'errors': 0,
         }
+        self._no_subscriber_log_times: Dict[Type[Event], float] = {}
+
+    def _log_no_subscribers(self, event_cls: Type[Event]) -> None:
+        """首次立即记录，之后同一事件类型每小时最多记录一次。"""
+        now = _monotonic()
+        last_log_at = self._no_subscriber_log_times.get(event_cls)
+        if (
+            last_log_at is not None
+            and now - last_log_at < _NO_SUBSCRIBER_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._no_subscriber_log_times[event_cls] = now
+        logger.debug(f"📢 事件 {event_cls.__name__} 没有订阅者")
     
     def subscribe(
         self,
@@ -232,8 +248,8 @@ class EventBus:
         self._stats['events_emitted'] += 1
         
         event_cls = type(event)
-        if event_cls not in self._subscribers:
-            logger.debug(f"📢 事件 {event_cls.__name__} 没有订阅者")
+        if not self._subscribers.get(event_cls):
+            self._log_no_subscribers(event_cls)
             return
         
         logger.debug(f"📢 发布事件: {event}")
