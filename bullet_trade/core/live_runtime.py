@@ -24,6 +24,7 @@ from .globals import g, log
 _runtime_dir: Optional[str] = None
 _autosave_thread: Optional[threading.Thread] = None
 _stop_flag = threading.Event()
+_save_lock = threading.RLock()
 _state_cache: Optional[Dict[str, Any]] = None
 _state_lock = threading.Lock()
 _restored_from_disk = False
@@ -101,6 +102,7 @@ def init_live_runtime(runtime_dir: str) -> None:
     初始化 live 运行态：创建目录并尝试加载 g，同时准备扩展状态。
     """
     global _runtime_dir, _restored_from_disk, _portfolio_ref, _portfolio_price_refresher
+    stop_g_autosave()
     _runtime_dir = os.path.abspath(os.path.expanduser(runtime_dir))
     os.makedirs(_runtime_dir, exist_ok=True)
     # 重置状态缓存
@@ -134,28 +136,29 @@ def save_g() -> None:
     """
     立即保存 g 到 RUNTIME_DIR/g.pkl，并附带保存子账户快照。
     """
-    if _runtime_dir is None:
-        return
-    try:
-        tmp = _g_path() + '.tmp'
-        with open(tmp, 'wb') as f:
-            pickle.dump(getattr(g, '_data', {}), f, protocol=pickle.HIGHEST_PROTOCOL)
-        os.replace(tmp, _g_path())
-        _log_save_success('g', f'🛟 已保存 g 到 {_g_path()}')
+    # 策略线程、自动保存线程和退出保存共用临时文件，必须串行写入。
+    with _save_lock:
+        if _runtime_dir is None:
+            return
+        try:
+            tmp = _g_path() + '.tmp'
+            with open(tmp, 'wb') as f:
+                pickle.dump(getattr(g, '_data', {}), f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, _g_path())
+            _log_save_success('g', f'🛟 已保存 g 到 {_g_path()}')
 
-    except Exception as e:
-        log.error(f'🛟 保存 g 失败: {e}')
+        except Exception as e:
+            log.error(f'🛟 保存 g 失败: {e}')
 
-    # 附带保存子账户快照
-    try:
-        save_subportfolios()
-    except Exception:
-        pass
+        # 附带保存子账户快照
+        try:
+            save_subportfolios()
+        except Exception:
+            pass
 
 
 def _autosave_worker(interval_sec: int) -> None:
-    while not _stop_flag.is_set():
-        time.sleep(max(1, interval_sec))
+    while not _stop_flag.wait(max(1, interval_sec)):
         try:
             save_g()
         except Exception:
@@ -167,21 +170,37 @@ def start_g_autosave(interval_sec: int = 60) -> None:
     启动后台线程周期性保存 g。
     """
     global _autosave_thread
-    _stop_flag.clear()
     if _autosave_thread and _autosave_thread.is_alive():
         return
+    _stop_flag.clear()
     _autosave_thread = threading.Thread(target=_autosave_worker, args=(interval_sec,), daemon=True)
     _autosave_thread.start()
     atexit.register(save_g)
 
 
 def stop_g_autosave() -> None:
+    """唤醒等待中的线程，等正在执行的保存结束，并注销退出保存回调。"""
+    global _autosave_thread
     _stop_flag.set()
-    try:
-        if _autosave_thread and _autosave_thread.is_alive():
-            _autosave_thread.join(timeout=1)
-    except Exception:
-        pass
+    atexit.unregister(save_g)
+    thread = _autosave_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join()
+        _autosave_thread = None
+
+
+def close_live_runtime(*, save: bool = True) -> None:
+    """在券商断开前完成最终保存，随后禁止迟到的回调继续访问该运行态。"""
+    global _runtime_dir, _portfolio_ref, _portfolio_price_refresher
+    stop_g_autosave()
+    with _save_lock:
+        try:
+            if save:
+                save_g()
+        finally:
+            _portfolio_price_refresher = None
+            _portfolio_ref = None
+            _runtime_dir = None
 
 
 def load_scheduler_cursor() -> Optional[datetime]:

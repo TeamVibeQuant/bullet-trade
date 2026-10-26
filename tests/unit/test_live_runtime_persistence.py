@@ -1,4 +1,7 @@
 import os
+import threading
+
+from unittest.mock import Mock
 
 from bullet_trade.core import live_runtime
 from bullet_trade.core.globals import g
@@ -35,6 +38,48 @@ def test_autosave_thread(tmp_path):
     stop_g_autosave()
     path = os.path.join(str(runtime), "g.pkl")
     assert os.path.exists(path)
+
+
+def test_stopping_autosave_wakes_idle_worker_without_an_extra_save(tmp_path, monkeypatch):
+    init_live_runtime(str(tmp_path / "runtime"))
+    save = Mock()
+    monkeypatch.setattr(live_runtime, "save_g", save)
+    start_g_autosave(interval_sec=3600)
+    worker = live_runtime._autosave_thread
+    try:
+        stop_g_autosave()
+        assert not worker.is_alive()
+        save.assert_not_called()
+    finally:
+        stop_g_autosave()
+
+
+def test_stopping_autosave_waits_for_inflight_save(tmp_path, monkeypatch):
+    init_live_runtime(str(tmp_path / "runtime"))
+    entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+    calls = []
+
+    def save():
+        calls.append("save")
+        entered.set()
+        assert release.wait(5)
+
+    monkeypatch.setattr(live_runtime, "save_g", save)
+    start_g_autosave(interval_sec=1)
+    worker = live_runtime._autosave_thread
+    stopper = threading.Thread(target=lambda: (stop_g_autosave(), stopped.set()))
+    try:
+        assert entered.wait(3)
+        stopper.start()
+        assert not stopped.wait(0.1)
+    finally:
+        release.set()
+        if stopper.ident is not None:
+            stopper.join(timeout=3)
+        stop_g_autosave()
+    assert stopped.is_set()
+    assert not worker.is_alive()
+    assert calls == ["save"]
 
 
 def test_save_success_logs_immediately_then_at_most_hourly(

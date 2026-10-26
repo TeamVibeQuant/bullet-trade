@@ -49,6 +49,15 @@ QMT 和外部 server 必须在同一台 Windows 电脑、同一个用户的登�
    应显示 `transport=shm`、`shm_alive=true`、`ready=true`、`gateway_build_id=20261026_shm_v1`。诊断不下单、不撤单，不打印密码或资金余额。
 6. 运行 `run_bullettrade_server.bat`，再运行 `run_bullettrade_live.bat` 选择 2。策略仍使用 `--broker qmt-remote`，无需改策略文件或 remote 环境文件。
 
+## Live 初始化与退出
+
+- Live 先连接 broker 并读取账户初始快照，再执行 `initialize`、`after_code_changed`（需要时）和 `process_initialize`。首次账户同步失败会中止初始化。
+- 初始化期间读取 `context.portfolio` 使用已取得的初始值，不触发额外账户查询或对临时子账户做现金对账。子账户恢复和初始化完成后，才保存运行态并启动自动保存、后台查询。
+- 退出时等待正在执行的同步查询和自动保存结束，在 broker 连接仍可用、运行锁仍持有时完成最终保存，再断开连接、释放锁。已关闭运行态的迟到保存回调不会再次访问 broker。
+- 保存前账户或持仓查询失败时保留上次子账户快照；持仓查询异常不会被解释成空仓。初始化未完成就中断时，也不会在退出流程中覆盖上次运行态。
+
+验证顺序：启动 live 后确认账户资金、持仓及子账户恢复结果，再按 Ctrl+C 退出。连接可用时 `subportfolios.json` 的 `saved_at` 应更新到退出时间，退出日志不应再出现 `remote connection 尚未启动`。这些修复位于外部 Python 的 live/broker 层，无需重新复制 QMT helper。
+
 ## 请求与故障语义
 
 - 单槽串行 RPC，16 MiB 默认容量。已有全部 JSON 路由保留，包括行情、历史、交易日、成分股、账户、持仓、委托、成交、下单、撤单。

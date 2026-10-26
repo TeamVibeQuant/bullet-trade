@@ -76,7 +76,7 @@ from ..broker.simulator import SimulatorBroker
 from .live_runtime import (
     init_live_runtime,
     start_g_autosave,
-    stop_g_autosave,
+    close_live_runtime,
     save_g,
     register_portfolio,
     register_portfolio_price_refresher,
@@ -275,6 +275,9 @@ class LiveEngine:
         self._runtime_lock: Optional[ManagedLiveLock] = None
         self._instance_lock: Optional[ManagedLiveLock] = None
         self._subportfolios_restored: bool = False
+        self._runtime_initialized: bool = False
+        self._initializing: bool = False
+        self._shutdown_started: bool = False
         self._pending_virtual_orders: Dict[str, _PendingVirtualOrder] = {}
         self._active_order_submissions: int = 0
         self._suppress_cash_reconcile_until: Optional[datetime] = None
@@ -322,11 +325,6 @@ class LiveEngine:
         except Exception as exc:
             log.error(f"实盘引擎异常退出: {exc}", exc_info=True)
             return 2
-        finally:
-            try:
-                save_g()
-            except Exception:
-                pass
 
     async def start(self) -> None:
         """
@@ -346,9 +344,11 @@ class LiveEngine:
             await self.event_bus.emit(SystemStartEvent())
             await self._run_loop()
         finally:
-            if bootstrapped:
-                await self.event_bus.emit(SystemStopEvent())
-            await self._shutdown()
+            try:
+                if bootstrapped:
+                    await self.event_bus.emit(SystemStopEvent())
+            finally:
+                await self._shutdown()
 
     # ------------------------------------------------------------------
     # 初始化 & 清理
@@ -356,6 +356,9 @@ class LiveEngine:
 
     async def _bootstrap(self) -> None:
         log.info("🧠 初始化 Live 引擎")
+        self._initializing = True
+        self._shutdown_started = False
+        self._subportfolios_restored = False
         if not self.strategy_path.exists():
             raise FileNotFoundError(f"策略文件不存在: {self.strategy_path}")
 
@@ -379,8 +382,7 @@ class LiveEngine:
         self._acquire_live_locks()
 
         init_live_runtime(self.config.runtime_dir)
-        if self.config.g_autosave_enabled:
-            start_g_autosave(self.config.g_autosave_interval)
+        self._runtime_initialized = True
         g.live_trade = True
 
         reset_settings()
@@ -404,6 +406,10 @@ class LiveEngine:
             metadata_applied,
         )
 
+        # 策略初始化读取 starting_cash 时，必须已取得券商真实资产。
+        # 子账户恢复完成前，portfolio 的属性读取只使用这一份初始快照。
+        self._init_broker()
+
         if not restored_runtime or not metadata_applied:
             await self._call_hook(self.initialize_func)
 
@@ -420,8 +426,6 @@ class LiveEngine:
         if hash_changed and self.after_code_changed_func:
             await self._call_hook(self.after_code_changed_func)  # NOTE
 
-        self._init_broker()
-
         await self._call_hook(self.process_initialize_func)
 
         # 必须在 process_initialize 之后恢复子账户状态，因为
@@ -432,11 +436,6 @@ class LiveEngine:
         register_portfolio_price_refresher(
             lambda force_log=False: self._refresh_subportfolio_snapshot_for_save(force_log=force_log)
         )
-        try:
-            save_g()
-        except Exception as exc:
-            log.debug(f"子账户恢复完成后保存运行态失败: {exc}")
-
         self._dedupe_scheduler_tasks()
 
         # 若策略已通过 run_daily/run_weekly 注册了相同函数，则避免 LiveEngine 再直接调用，防止重复触发
@@ -472,36 +471,48 @@ class LiveEngine:
                 )
                 self._last_schedule_dt = None
 
+        try:
+            save_g()
+        except Exception as exc:
+            log.debug(f"子账户恢复完成后保存运行态失败: {exc}")
+        self._initializing = False
+        self.portfolio_proxy._last_refresh = datetime.min
+        if self.config.g_autosave_enabled:
+            start_g_autosave(self.config.g_autosave_interval)
         self._start_background_jobs()
 
     async def _shutdown(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
         log.info("🛑 正在关闭 Live 引擎")
         if self._stop_event:
             self._stop_event.set()
-        for task in self._background_tasks:
-            task.cancel()
-        for task in self._background_tasks:
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                log.warning(f"后台任务退出异常: {exc}")
-        self._background_tasks = []
+        try:
+            for task in self._background_tasks:
+                task.cancel()
+            for task in self._background_tasks:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    log.warning(f"后台任务退出异常: {exc}")
+            self._background_tasks = []
 
-        if self.broker:
+            if self._runtime_initialized:
+                # 停止自动保存、完成最后一次同步保存，再断开 broker、释放锁。
+                # 初始化失败时不把尚未恢复完成的状态覆盖到上次运行快照。
+                close_live_runtime(save=not self._initializing)
+        finally:
+            self._runtime_initialized = False
             try:
-                self.broker.cleanup()
+                if self.broker:
+                    self.broker.cleanup()
             except Exception as exc:
                 log.warning(f"券商清理失败: {exc}")
-
-        if self.config.g_autosave_enabled:
-            try:
-                stop_g_autosave()
             finally:
                 self._release_live_locks()
-        else:
-            self._release_live_locks()
 
     # ------------------------------------------------------------------
     # 主循环
@@ -2013,7 +2024,7 @@ class LiveEngine:
 
         try:
             if self._loop and self._loop.is_running():
-                snapshot = await self._loop.run_in_executor(None, self.broker.sync_account)
+                snapshot = await self._run_blocking(self.broker.sync_account)
             else:
                 snapshot = self.broker.sync_account()
         except Exception as exc:
@@ -2356,7 +2367,7 @@ class LiveEngine:
             if self._tick_symbols:
                 for sym in list(self._tick_symbols):
                     try:
-                        tick = await self._loop.run_in_executor(None, self._fetch_tick_snapshot, sym)
+                        tick = await self._run_blocking(self._fetch_tick_snapshot, sym)
                     except Exception:
                         tick = None
                     if tick:
@@ -2429,7 +2440,7 @@ class LiveEngine:
             return
         assert self._loop is not None
         try:
-            snapshot = await self._loop.run_in_executor(None, self.broker.sync_account)
+            snapshot = await self._run_blocking(self.broker.sync_account)
         except Exception as exc:
             log.warning(f"账户同步失败，准备检查券商连接: {exc}")
             await self._reconnect_broker(f"account-sync failed: {exc}")
@@ -2447,7 +2458,7 @@ class LiveEngine:
             return
         assert self._loop is not None
         try:
-            broker_orders = await self._loop.run_in_executor(None, self._sync_orders_from_broker)
+            broker_orders = await self._run_blocking(self._sync_orders_from_broker)
             if broker_orders:
                 self._apply_order_snapshots(broker_orders)
         except Exception as exc:
@@ -2669,7 +2680,7 @@ class LiveEngine:
         except Exception as exc:
             log.debug(f"检查券商连接状态失败: {exc}")
         try:
-            await self._loop.run_in_executor(None, self.broker.heartbeat)
+            await self._run_blocking(self.broker.heartbeat)
         except Exception as exc:
             log.warning(f"券商心跳异常，准备重连: {exc}")
             await self._reconnect_broker(f"heartbeat failed: {exc}")
@@ -2707,11 +2718,11 @@ class LiveEngine:
             try:
                 log.warning("开始重连券商: %s", reason)
                 try:
-                    await self._loop.run_in_executor(None, self.broker.cleanup)
+                    await self._run_blocking(self.broker.cleanup)
                 except Exception as exc:
                     log.debug(f"券商重连前清理失败: {exc}")
 
-                await self._loop.run_in_executor(None, self.broker.connect)
+                await self._run_blocking(self.broker.connect)
                 summary = self._safe_account_info()
                 positions = summary.get('positions') or []
                 log.info(
@@ -2820,19 +2831,15 @@ class LiveEngine:
             except Exception as exc:
                 log.debug(f"恢复子账户后获取券商快照失败: {exc}")
 
-            recovered = self._recover_missing_subportfolio_positions(backing, broker_snapshot)
-            refreshed = self._refresh_subportfolio_prices(backing, snapshot=broker_snapshot)
-            cash_reconciled = self._reconcile_subportfolio_cash(
+            self._recover_missing_subportfolio_positions(backing, broker_snapshot)
+            self._refresh_subportfolio_prices(backing, snapshot=broker_snapshot)
+            self._reconcile_subportfolio_cash(
                 backing,
                 self._to_float((broker_snapshot or {}).get("available_cash"), default=None) if broker_snapshot else None,
             )
             backing.update_value()
             self._subportfolios_restored = True
-            if refreshed or cash_reconciled or recovered:
-                try:
-                    save_g()
-                except Exception as exc:
-                    log.debug(f"恢复子账户后保存刷新价格/现金失败: {exc}")
+            # 由 _bootstrap 在所有初始化钩子及恢复步骤结束后统一保存。
             return
 
         # 回退：首次启动（无快照），按比例分配券商真实资金
@@ -3160,12 +3167,17 @@ class LiveEngine:
         backing = self._portfolio
         snapshot = None
         if self.broker and self.broker.supports_account_sync():
+            if self._broker_is_connected() is False:
+                log.debug("券商连接不可用，保留上次子账户快照")
+                return "skip_save"
             try:
                 snapshot = self.broker.sync_account()
             except Exception as exc:
                 log.debug(f"保存子账户快照前同步券商账户失败: {exc}")
-                if self._virtual_position_amount(backing) <= 0:
-                    return "skip_save"
+                return "skip_save"
+            if not snapshot:
+                log.warning("保存前券商账户快照为空，保留上次子账户快照")
+                return "skip_save"
 
         recovered = self._recover_missing_subportfolio_positions(backing, snapshot)
         synced_positions = self._sync_subportfolio_positions_from_broker_snapshot(
@@ -3188,6 +3200,8 @@ class LiveEngine:
         assert self.broker is not None
         self.broker.connect()
         summary = self._safe_account_info()
+        if self.broker.supports_account_sync() and not summary:
+            raise RuntimeError("券商首次账户同步失败，停止初始化")
         positions = summary.get('positions') or []
         log.info(
             "✅ 券商 %s 连接成功: account_id=%s, type=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
@@ -3377,6 +3391,27 @@ class LiveEngine:
             return base_args
         return base_args[:max_args]
 
+    async def _run_blocking(self, func: Callable, *args) -> Any:
+        """取消协程时等待同步调用结束，避免关闭连接后线程仍继续查询。"""
+        assert self._loop is not None
+        future = self._loop.run_in_executor(None, func, *args)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # asyncio.run 的退出取消与 _shutdown 的任务取消可能先后到达。
+            # 重复取消也不能把 executor 的 Future 取消掉：线程并不会随之停止。
+            while True:
+                try:
+                    await asyncio.shield(future)
+                    break
+                except asyncio.CancelledError:
+                    if future.done():
+                        break
+                except Exception as exc:
+                    log.debug(f"等待已取消任务的同步调用结束时发生异常: {exc}")
+                    break
+            raise
+
     async def _call_hook(self, func: Optional[Callable], *extra_args) -> None:
         if not func:
             return
@@ -3385,7 +3420,7 @@ class LiveEngine:
             await func(*args)
         else:
             assert self._loop is not None
-            await self._loop.run_in_executor(None, lambda: func(*args))
+            await self._run_blocking(func, *args)
 
     async def _call_broker_lifecycle_hook(self, hook_name: str) -> None:
         if not self.broker:
@@ -3398,7 +3433,7 @@ class LiveEngine:
                 await hook()
             else:
                 assert self._loop is not None
-                await self._loop.run_in_executor(None, hook)
+                await self._run_blocking(hook)
         except Exception as exc:
             log.warning(f"broker 生命周期钩子 {hook_name} 执行失败: {exc}")
 
@@ -3789,7 +3824,11 @@ class LiveEngine:
         return periods
 
     def refresh_account_snapshot(self, force: bool = False, reconcile_cash: bool = True) -> None:
+        if self._initializing or self._shutdown_started:
+            return
         if not self.broker or not self.broker.supports_account_sync():
+            return
+        if self._broker_is_connected() is False:
             return
         now = datetime.now()
         if not force and self._last_account_refresh and (now - self._last_account_refresh).total_seconds() < 1:

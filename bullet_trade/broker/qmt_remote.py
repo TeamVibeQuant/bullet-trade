@@ -168,7 +168,10 @@ class RemoteQmtBroker(BrokerBase):
     def get_account_info(self) -> Dict[str, Any]:
         payload = self._base_payload()
         resp = self._connection.request("broker.account", payload)
-        return resp.get("value") or resp
+        account = resp.get("value", resp)
+        if not isinstance(account, dict) or not account:
+            raise RuntimeError("远程券商账户查询返回空数据")
+        return account
 
     def get_positions(self) -> List[Dict[str, Any]]:
         payload = self._base_payload()
@@ -270,10 +273,8 @@ class RemoteQmtBroker(BrokerBase):
     def sync_account(self) -> Dict[str, Any]:
         """同步账户快照，兼容 LiveEngine 需要的现金+持仓联合视图。"""
         payload = dict(self.get_account_info() or {})
-        try:
-            payload["positions"] = self.get_positions()
-        except Exception:
-            payload.setdefault("positions", [])
+        # 查询失败不能伪装成空仓，否则保存时会删除已有的虚拟持仓。
+        payload["positions"] = self.get_positions()
         return payload
 
     def _place_order(
