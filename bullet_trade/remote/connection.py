@@ -268,6 +268,10 @@ class RemoteQmtConnection:
             await asyncio.sleep(0.2)
 
     async def _request_async(self, action: str, payload: Dict) -> Dict:
+        trading_action = action in {"broker.place_order", "broker.cancel_order"}
+        if action == "broker.place_order":
+            payload = dict(payload)
+            payload.setdefault("idempotency_key", str(uuid.uuid4()))
         last_error: Optional[Exception] = None
         while not self._stop.is_set():
             await self._wait_until_connected()
@@ -285,6 +289,12 @@ class RemoteQmtConnection:
                 self._pending.pop(req_id, None)
                 if not self._should_retry(exc):
                     raise
+                if trading_action:
+                    # A socket disconnect does not prove the broker rejected
+                    # the request. Never replay an order/cancel automatically.
+                    raise RuntimeError(
+                        f"远程交易请求连接中断，状态=submit_unknown: action={action}; 请核对委托，禁止自动重发"
+                    ) from exc
                 last_error = exc
                 await asyncio.sleep(0.2)
         raise last_error or RuntimeError("连接已停止")

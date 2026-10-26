@@ -1,13 +1,13 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-07-02
-# Version: 20260703_miniqmt_alignment
+# Version: 20261026_shm_v1
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
-# BulletTrade-compatible local HTTP/JSON data and trading gateway.
+# BulletTrade-compatible Windows shared-memory data and trading gateway.
 # Big QMT embedded gateway strategy sample.
-# Run this file inside a dedicated Big QMT strategy to expose a local HTTP/JSON
-# bridge. Validate scheduling, thread boundaries and QMT API availability in a
+# Run this file inside a dedicated Big QMT strategy to expose a local memory/JSON
+# bridge (legacy HTTP is optional). Validate QMT API availability in a
 # simulation environment before production use.
 
 import json
@@ -24,13 +24,23 @@ import datetime as dt
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-import tornado.ioloop
-import tornado.web
-
-
 # =========================
 # Operator Configuration
 # =========================
+
+# Default: no network or filesystem IO in the QMT helper. ctypes calls Windows
+# pagefile-backed named memory and mutex APIs; no multiprocessing/shm package.
+# Set "http" explicitly on BOTH endpoints only for legacy clients.
+GATEWAY_TRANSPORT = "shm"
+SHM_NAME = r"Local\BulletTrade_BigQMT_v1"
+SHM_SIZE = 16 * 1024 * 1024
+SHM_POLL_SECONDS = 0.01
+
+if GATEWAY_TRANSPORT == "http":
+    import tornado.ioloop
+    import tornado.web
+elif GATEWAY_TRANSPORT != "shm":
+    raise ValueError("GATEWAY_TRANSPORT must be shm or http")
 
 # Local bind host for the HTTP gateway. Keep 127.0.0.1 unless another machine
 # must connect directly to this QMT process.
@@ -42,7 +52,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
+GATEWAY_BUILD_ID = "20261026_shm_v1"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -190,6 +200,310 @@ LOG_DIR = ""
 LOG_FILE_NAME = "bt_big_qmt_gateway.log"
 
 
+# BEGIN GENERATED SHARED MEMORY RPC
+"""Windows local RPC. Python 3.6 compatible; embedded verbatim in the QMT helper.
+
+No sockets, disk-backed mappings, multiprocessing, or third-party dependencies.
+One mailbox, with separate owner, transaction and short-lived state mutexes.
+Never replay a published request. A claimed request cannot be cancelled safely.
+"""
+import hashlib
+import json
+import math
+import struct
+import sys
+import time
+from contextlib import contextmanager
+from uuid import uuid4
+
+
+IPC_DEFAULT_NAME = r"Local\BulletTrade_BigQMT_v1"
+IPC_DEFAULT_SIZE = 16 * 1024 * 1024
+IPC_HEADER = struct.Struct("<8sII16sQIddI32s")
+IPC_MAGIC = b"BTQMTIPC"
+IPC_VERSION = 1
+IPC_IDLE, IPC_REQUEST, IPC_RUNNING, IPC_RESPONSE, IPC_OFFLINE = range(5)
+
+
+class ShmError(RuntimeError):
+    def __init__(self, code, message, uncertain=False):
+        super().__init__(message)
+        self.code = code
+        self.uncertain = uncertain
+
+
+def _ipc_ctypes():
+    cached = sys.modules.get("ctypes")
+    try:
+        import ctypes
+        return ctypes, "standard_import"
+    except Exception:
+        # Some embedded interpreters already loaded ctypes but reject imports.
+        if cached is not None and all(hasattr(cached, n) for n in
+                                      ("WinDLL", "c_void_p", "memmove", "string_at")):
+            return cached, "loaded_modules"
+        raise ShmError("IPC_UNAVAILABLE", "ctypes is unavailable in this QMT build")
+
+
+class Win32Region:
+    """Pagefile-backed named memory; handles/pointers have explicit Win64 types."""
+    def __init__(self, name, size, create=False):
+        if sys.platform != "win32":
+            raise ShmError("IPC_UNAVAILABLE", "Shared-memory gateway requires Windows")
+        if not name.startswith("Local\\") or "\\" in name[6:] or len(name) > 200:
+            raise ValueError("IPC name must be Local\\<name> in the same Windows session")
+        if not 4096 <= size <= 256 * 1024 * 1024:
+            raise ValueError("IPC size must be between 4 KiB and 256 MiB")
+        self.size = size
+        self.ptr = None
+        self.handles = []
+        self.mutexes = {}
+        self.owner = False
+        self.ct, self.load_mode = _ipc_ctypes()
+        c = self.ct
+        self.k = c.WinDLL("kernel32", use_last_error=True)
+        signatures = {
+            "CreateFileMappingW": ([c.c_void_p, c.c_void_p, c.c_uint32, c.c_uint32, c.c_uint32, c.c_wchar_p], c.c_void_p),
+            "OpenFileMappingW": ([c.c_uint32, c.c_int, c.c_wchar_p], c.c_void_p),
+            "MapViewOfFile": ([c.c_void_p, c.c_uint32, c.c_uint32, c.c_uint32, c.c_size_t], c.c_void_p),
+            "UnmapViewOfFile": ([c.c_void_p], c.c_int),
+            "CreateMutexW": ([c.c_void_p, c.c_int, c.c_wchar_p], c.c_void_p),
+            "WaitForSingleObject": ([c.c_void_p, c.c_uint32], c.c_uint32),
+            "ReleaseMutex": ([c.c_void_p], c.c_int),
+            "CloseHandle": ([c.c_void_p], c.c_int),
+        }
+        for func, (args, result) in signatures.items():
+            fn = getattr(self.k, func)
+            fn.argtypes, fn.restype = args, result
+        try:
+            for suffix in ("owner", "transaction", "state"):
+                handle = self._checked(self.k.CreateMutexW(None, False, name + "." + suffix))
+                self.handles.append(handle)
+                self.mutexes[suffix] = handle
+            if create:
+                # Held by the QMT strategy thread for the complete serving lifetime.
+                self.acquire("owner", 0, abandoned_ok=True)
+                self.owner = True
+                mapping = self._checked(self.k.CreateFileMappingW(c.c_void_p(-1), None, 4, 0, size, name))
+            else:
+                mapping = self._checked(self.k.OpenFileMappingW(6, False, name))
+            self.handles.append(mapping)
+            self.ptr = self._checked(self.k.MapViewOfFile(mapping, 6, 0, 0, size))
+        except BaseException:
+            self.close()
+            raise
+
+    def _checked(self, value):
+        if not value:
+            raise ShmError("IPC_UNAVAILABLE", "Win32 IPC failed (error=%s); check QMT, session and mapping size" % self.ct.get_last_error())
+        return value
+
+    def acquire(self, which, seconds, abandoned_ok=False):
+        result = self.k.WaitForSingleObject(self.mutexes[which], min(0xfffffffe, max(0, int(seconds * 1000))))
+        if result == 0x102:
+            raise ShmError("IPC_BUSY", "Timed out acquiring IPC %s mutex" % which)
+        if result == 0x80:
+            if not abandoned_ok:
+                self.k.ReleaseMutex(self.mutexes[which])
+                raise ShmError("IPC_CORRUPT", "Abandoned IPC state mutex; restart both endpoints")
+        elif result != 0:
+            raise ShmError("IPC_UNAVAILABLE", "WaitForSingleObject failed: %s" % self.ct.get_last_error())
+
+    def release(self, which):
+        self._checked(self.k.ReleaseMutex(self.mutexes[which]))
+
+    @contextmanager
+    def locked(self, which="state", seconds=1.0, abandoned_ok=False):
+        self.acquire(which, seconds, abandoned_ok)
+        try:
+            yield
+        finally:
+            self.release(which)
+
+    def read(self, offset, length):
+        self._bounds(offset, length)
+        return self.ct.string_at(self.ptr + offset, length)
+
+    def write(self, offset, data):
+        self._bounds(offset, len(data))
+        self.ct.memmove(self.ptr + offset, data, len(data))
+
+    def _bounds(self, offset, length):
+        if self.ptr is None or offset < 0 or length < 0 or offset + length > self.size:
+            raise ShmError("IPC_CORRUPT", "IPC memory access outside configured mapping")
+
+    def close(self):
+        if self.ptr is not None:
+            self.k.UnmapViewOfFile(self.ptr)
+            self.ptr = None
+        if self.owner:
+            self.k.ReleaseMutex(self.mutexes["owner"])
+            self.owner = False
+        for handle in reversed(self.handles):
+            self.k.CloseHandle(handle)
+        self.handles = []
+
+
+def _ipc_header(region):
+    h = list(IPC_HEADER.unpack(region.read(0, IPC_HEADER.size)))
+    if h[:3] != [IPC_MAGIC, IPC_VERSION, region.size] or h[5] not in range(5):
+        raise ShmError("IPC_PROTOCOL", "IPC header/version/size mismatch; check both endpoints")
+    if not math.isfinite(h[6]) or not math.isfinite(h[7]):
+        raise ShmError("IPC_CORRUPT", "Invalid IPC timestamp")
+    return h
+
+
+def _ipc_encode(value, region):
+    raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(raw) > region.size - IPC_HEADER.size:
+        raise ShmError("IPC_TOO_LARGE", "JSON exceeds IPC capacity; split query or increase both mapping sizes")
+    return raw
+
+
+def _ipc_read(region, header):
+    size = header[8]
+    if size <= 0 or size > region.size - IPC_HEADER.size:
+        raise ShmError("IPC_CORRUPT", "Invalid IPC payload length")
+    raw = region.read(IPC_HEADER.size, size)
+    if hashlib.sha256(raw).digest() != header[9]:
+        raise ShmError("IPC_CORRUPT", "IPC payload checksum mismatch")
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise ShmError("IPC_CORRUPT", "Invalid IPC JSON")
+    if not isinstance(value, dict):
+        raise ShmError("IPC_CORRUPT", "IPC envelope must be an object")
+    return value
+
+
+def _ipc_write(region, header, state, raw=None):
+    if raw is not None:
+        region.write(IPC_HEADER.size, raw)
+        header[8], header[9] = len(raw), hashlib.sha256(raw).digest()
+    header[5] = state
+    region.write(0, IPC_HEADER.pack(*header))
+
+
+class ShmRpcServer:
+    def __init__(self, region, dispatch):
+        self.region, self.dispatch = region, dispatch
+        self.session = uuid4().bytes
+        with region.locked():
+            header = [IPC_MAGIC, IPC_VERSION, region.size, self.session, 0,
+                      IPC_IDLE, 0.0, time.time(), 0, b"\0" * 32]
+            region.write(0, IPC_HEADER.pack(*header))
+
+    def poll(self):
+        region = self.region
+        with region.locked():
+            h = _ipc_header(region)
+            if h[3] != self.session:
+                raise ShmError("IPC_RESTARTED", "IPC owner session changed")
+            h[7] = time.time()
+            if h[5] != IPC_REQUEST:
+                region.write(0, IPC_HEADER.pack(*h))
+                return False
+            request = _ipc_read(region, h)
+            expired = time.time() >= h[6]
+            _ipc_write(region, h, IPC_RUNNING)
+        # QMT calls happen only on the serving (init) thread, outside state lock.
+        if expired:
+            response = {"ipc_error": "IPC_EXPIRED", "message": "Request expired before dispatch", "uncertain": False}
+        else:
+            try:
+                response = self.dispatch(request)
+            except Exception as exc:
+                response = {"ipc_error": "IPC_DISPATCH_FAILED", "message": "%s: %s" % (type(exc).__name__, exc), "uncertain": True}
+        try:
+            raw = _ipc_encode(response, region)
+        except (ShmError, ValueError, TypeError) as exc:
+            raw = _ipc_encode({"ipc_error": "IPC_RESPONSE_INVALID", "message": str(exc), "uncertain": True}, region)
+        with region.locked():
+            current = _ipc_header(region)
+            if current[3] != self.session or current[4] != h[4] or current[5] != IPC_RUNNING:
+                raise ShmError("IPC_CORRUPT", "In-flight IPC request was overwritten")
+            h[7] = time.time()
+            _ipc_write(region, h, IPC_RESPONSE, raw)
+        return True
+
+    def close(self):
+        try:
+            with self.region.locked():
+                h = _ipc_header(self.region)
+                if h[3] == self.session:
+                    _ipc_write(self.region, h, IPC_OFFLINE)
+        finally:
+            self.region.close()
+
+
+class ShmRpcClient:
+    def __init__(self, name=IPC_DEFAULT_NAME, size=IPC_DEFAULT_SIZE, poll_seconds=0.01,
+                 region_factory=Win32Region):
+        self.name, self.size = name, size
+        self.poll_seconds = max(0.001, float(poll_seconds))
+        self.region_factory = region_factory
+
+    def request(self, request, timeout=10.0, prepare=None):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("IPC timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
+        region = self.region_factory(self.name, self.size, create=False)
+        published = False
+        try:
+            with region.locked("transaction", max(0, deadline - time.monotonic()), abandoned_ok=True):
+                # Never overwrite a request still being executed, even after timeout.
+                while True:
+                    with region.locked():
+                        h = _ipc_header(region)
+                        if h[5] == IPC_OFFLINE or time.time() - h[7] > max(timeout, 5):
+                            raise ShmError("IPC_UNAVAILABLE", "QMT helper is offline or unresponsive")
+                        if h[5] not in (IPC_REQUEST, IPC_RUNNING):
+                            break
+                    if time.monotonic() >= deadline:
+                        raise ShmError("IPC_BUSY", "Previous QMT request is still in flight; nothing submitted")
+                    time.sleep(self.poll_seconds)
+                session, seq = h[3], h[4] + 1
+                envelope = dict(request)
+                if prepare is not None:
+                    envelope.update(prepare(session.hex()) or {})
+                raw = _ipc_encode(envelope, region)
+                if time.monotonic() >= deadline:
+                    raise ShmError("IPC_EXPIRED", "IPC deadline elapsed before publication")
+                with region.locked():
+                    current = _ipc_header(region)
+                    if current[3] != session or current[5] not in (IPC_IDLE, IPC_RESPONSE):
+                        raise ShmError("IPC_RESTARTED", "QMT changed before publication; nothing submitted")
+                    current[4], current[6] = seq, time.time() + max(0, deadline - time.monotonic())
+                    # From this point, partial writes/failures are also uncertain.
+                    published = True
+                    _ipc_write(region, current, IPC_REQUEST, raw)
+                while True:
+                    with region.locked():
+                        current = _ipc_header(region)
+                        if current[3] != session or current[4] != seq or current[5] == IPC_OFFLINE:
+                            raise ShmError("IPC_RESTARTED", "QMT restarted during request; reconcile orders before retry", True)
+                        if current[5] == IPC_RESPONSE:
+                            response = _ipc_read(region, current)
+                            _ipc_write(region, current, IPC_IDLE)
+                            if response.get("ipc_error"):
+                                published = bool(response.get("uncertain", True))
+                                raise ShmError(response["ipc_error"], response.get("message", "IPC error"), published)
+                            return response
+                        if time.monotonic() >= deadline:
+                            if current[5] == IPC_REQUEST:
+                                _ipc_write(region, current, IPC_IDLE)
+                                published = False
+                                raise ShmError("IPC_EXPIRED", "Request withdrawn before QMT claimed it")
+                            raise ShmError("IPC_OUTCOME_UNKNOWN", "QMT claimed request; outcome unknown, do not resubmit", True)
+                    time.sleep(self.poll_seconds)
+        except ShmError as exc:
+            exc.uncertain = exc.uncertain or published
+            raise
+        finally:
+            region.close()
+# END GENERATED SHARED MEMORY RPC
+
+
 def _boot_print(message: str) -> None:
     try:
         print("[BT_BIG_QMT] %s" % message)
@@ -219,17 +533,23 @@ def _resolve_log_file() -> str:
     return os.path.abspath(os.path.join(base_dir, LOG_FILE_NAME))
 
 
-try:
-    LOG_FILE = _resolve_log_file()
-    _boot_print("log file resolved log_file=%s cwd=%s file=%s" % (LOG_FILE, os.getcwd(), globals().get("__file__", "<no __file__>")))
-except Exception as exc:
-    LOG_FILE = os.path.abspath(LOG_FILE_NAME)
-    _boot_print("log file resolve failed fallback=%s error=%s" % (LOG_FILE, exc))
+LOG_FILE = ""
+if GATEWAY_TRANSPORT == "http":
+    try:
+        LOG_FILE = _resolve_log_file()
+        _boot_print("log file resolved log_file=%s cwd=%s file=%s" % (LOG_FILE, os.getcwd(), globals().get("__file__", "<no __file__>")))
+    except Exception as exc:
+        LOG_FILE = os.path.abspath(LOG_FILE_NAME)
+        _boot_print("log file resolve failed fallback=%s error=%s" % (LOG_FILE, exc))
 
 
 def _setup_logger() -> logging.Logger:
     logger = logging.getLogger("bt_big_qmt_gateway")
     logger.setLevel(LOG_LEVEL)
+    if GATEWAY_TRANSPORT == "shm":
+        logger.handlers = [logging.NullHandler()]
+        logger.propagate = False
+        return logger
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_exists = False
     for handler in logger.handlers:
@@ -284,7 +604,7 @@ _emit(
     "info",
     "logger ready log_file=%s cwd=%s file=%s",
     LOG_FILE,
-    os.getcwd(),
+    os.getcwd() if GATEWAY_TRANSPORT == "http" else "<filesystem disabled>",
     globals().get("__file__", "<no __file__>"),
 )
 
@@ -660,11 +980,16 @@ def _filter_virtual_account_rows(rows: List[Dict[str, Any]], payload: Optional[D
 
 
 def _order_tag_store_path() -> str:
+    if GATEWAY_TRANSPORT == "shm":
+        return "external_server_journal"
     return os.path.join(os.path.dirname(LOG_FILE), ORDER_TAG_STORE_FILE_NAME)
 
 
 def _load_order_tag_store_once() -> None:
     global ORDER_TAG_STORE_LOADED, ORDER_TAGS_BY_ID, PENDING_ORDER_TAGS
+    if GATEWAY_TRANSPORT == "shm":
+        ORDER_TAG_STORE_LOADED = True
+        return
     if ORDER_TAG_STORE_LOADED:
         return
     with ORDER_TAG_LOCK:
@@ -687,6 +1012,9 @@ def _load_order_tag_store_once() -> None:
 
 
 def _save_order_tag_store_locked() -> None:
+    if GATEWAY_TRANSPORT == "shm":
+        _prune_order_tags_locked()
+        return
     try:
         _prune_order_tags_locked()
         path = _order_tag_store_path()
@@ -715,6 +1043,10 @@ def _prune_order_tags_locked() -> None:
             old_ids.append(key)
     for key in old_ids:
         ORDER_TAGS_BY_ID.pop(key, None)
+    if len(ORDER_TAGS_BY_ID) > MAX_ORDER_TAGS:
+        ordered = sorted(ORDER_TAGS_BY_ID, key=lambda key: float(ORDER_TAGS_BY_ID[key].get("created_at") or 0))
+        for key in ordered[:-MAX_ORDER_TAGS]:
+            ORDER_TAGS_BY_ID.pop(key, None)
     kept = []
     for tag in PENDING_ORDER_TAGS:
         created_at = float(tag.get("created_at") or now)
@@ -2564,6 +2896,8 @@ class _GatewayRuntime:
         self.ioloop = None
         self.http_thread = None
         self.direct_dispatch = False
+        self.shm_server = None
+        self.shm_stop = False
 
     def _dispatch_now(self, action: str, payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:
         try:
@@ -2593,7 +2927,7 @@ class _GatewayRuntime:
                 return _error("QMT_API_NOT_READY", str(exc), request_id)
             return _error(
                 "QMT_ACTION_FAILED",
-                "%s\n%s" % (exc, traceback.format_exc()),
+                "%s\n%s" % (exc, (traceback.format_exc() if GATEWAY_TRANSPORT == "http" else type(exc).__name__)),
                 request_id,
             )
 
@@ -2648,7 +2982,7 @@ class _GatewayRuntime:
                 self.last_error = str(exc)
                 response = _error(
                     "QMT_ACTION_FAILED",
-                    "%s\n%s" % (exc, traceback.format_exc()),
+                    "%s\n%s" % (exc, (traceback.format_exc() if GATEWAY_TRANSPORT == "http" else type(exc).__name__)),
                     job["payload"].get("request_id"),
                 )
             job["response"] = response
@@ -2661,6 +2995,12 @@ class _GatewayRuntime:
         return {
             "ready": context_ready or qmt_api_ready,
             "http_alive": self.ioloop is not None,
+            "transport": GATEWAY_TRANSPORT,
+            "shm_alive": self.shm_server is not None and not self.shm_stop,
+            "shm_name": SHM_NAME if GATEWAY_TRANSPORT == "shm" else None,
+            "shm_size": SHM_SIZE if GATEWAY_TRANSPORT == "shm" else None,
+            "shm_session": self.shm_server.session.hex() if self.shm_server else None,
+            "ctypes_load_mode": getattr(self.shm_server.region, "load_mode", None) if self.shm_server else None,
             "init_called": self.init_called,
             "context_ready": context_ready,
             "qmt_api_ready": qmt_api_ready,
@@ -2676,7 +3016,7 @@ class _GatewayRuntime:
             "backend_type": "big_qmt",
             "strategy": "bt_big_qmt_gateway",
             "gateway_build_id": GATEWAY_BUILD_ID,
-            "listen": "%s:%s" % (LISTEN_HOST, LISTEN_PORT),
+            "listen": "%s:%s" % (LISTEN_HOST, LISTEN_PORT) if GATEWAY_TRANSPORT == "http" else SHM_NAME,
             "log_file": LOG_FILE,
             "account_id": ACCOUNT_ID,
             "account_type": ACCOUNT_TYPE,
@@ -2703,7 +3043,7 @@ class _GatewayRuntime:
 RUNTIME = _GatewayRuntime()
 
 
-class _GatewayHandler(tornado.web.RequestHandler):
+class _GatewayHandler(tornado.web.RequestHandler if GATEWAY_TRANSPORT == "http" else object):
     def set_default_headers(self) -> None:
         self.set_header("Content-Type", "application/json; charset=utf-8")
 
@@ -2845,7 +3185,7 @@ def _route_to_action(route: str, payload: Dict[str, Any]) -> Optional[str]:
     return mapping.get(route)
 
 
-def _build_application() -> tornado.web.Application:
+def _build_application() -> Any:
     routes = [
         (r"/health", _GatewayHandler),
         (r"/data/.*", _GatewayHandler),
@@ -2944,7 +3284,7 @@ def _tornado_thread_main(use_current_ioloop: bool = False) -> None:
         _emit("info", "entering tornado ioloop; gateway should keep running")
         RUNTIME.ioloop.start()
     except Exception as exc:
-        RUNTIME.last_error = "%s\n%s" % (exc, traceback.format_exc())
+        RUNTIME.last_error = "%s\n%s" % (exc, (traceback.format_exc() if GATEWAY_TRANSPORT == "http" else type(exc).__name__))
         LOGGER.exception("bt_big_qmt_gateway tornado thread failed: %s", exc)
         _emit("error", "http server failed listen=%s:%s error=%s", LISTEN_HOST, LISTEN_PORT, exc)
         RUNTIME.http_server = None
@@ -2952,17 +3292,80 @@ def _tornado_thread_main(use_current_ioloop: bool = False) -> None:
         RUNTIME.http_thread = None
 
 
+def _shm_dispatch(envelope):
+    global ORDER_TAG_STORE_LOADED, ORDER_TAGS_BY_ID, PENDING_ORDER_TAGS
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict) or not isinstance(envelope.get("headers"), dict):
+        return {"response": _error("BAD_REQUEST", "invalid IPC envelope")}
+    request_id = payload.get("request_id")
+    # Authenticate health too: it contains account and environment information.
+    if not _check_password(envelope["headers"]):
+        return {"response": _error("AUTH_FAILED", "gateway password mismatch", request_id)}
+    if envelope.get("method") not in ("GET", "POST"):
+        return {"response": _error("BAD_REQUEST", "unsupported method", request_id)}
+    if len(_json_bytes(payload)) > MAX_REQUEST_BODY_BYTES:
+        return {"response": _error("BAD_REQUEST", "request payload too large", request_id)}
+    if envelope.get("path") == "/health":
+        return {"response": _ok(RUNTIME.health(), request_id)}
+    action = _route_to_action(envelope.get("path"), payload)
+    if not action:
+        return {"response": _error("NOT_FOUND", "unknown IPC route", request_id)}
+    if not ORDER_TAG_STORE_LOADED:
+        tags = envelope.get("order_tags") or {"by_id": {}, "pending": []}
+        if not isinstance(tags, dict) or not isinstance(tags.get("by_id"), dict) or not isinstance(tags.get("pending"), list):
+            return {"response": _error("BAD_REQUEST", "invalid order tag checkpoint", request_id)}
+        if len(tags["by_id"]) > MAX_ORDER_TAGS or len(tags["pending"]) > MAX_ORDER_TAGS:
+            return {"response": _error("BAD_REQUEST", "order tag checkpoint too large", request_id)}
+        if not all(isinstance(tag, dict) for tag in list(tags["by_id"].values()) + tags["pending"]):
+            return {"response": _error("BAD_REQUEST", "invalid order tag entry", request_id)}
+        with ORDER_TAG_LOCK:
+            ORDER_TAGS_BY_ID = dict(tags["by_id"])
+            PENDING_ORDER_TAGS = list(tags["pending"])
+            _prune_order_tags_locked()
+            ORDER_TAG_STORE_LOADED = True
+    response = RUNTIME._dispatch_now(action, payload, request_id)
+    with ORDER_TAG_LOCK:
+        tags = {"by_id": dict(ORDER_TAGS_BY_ID), "pending": list(PENDING_ORDER_TAGS)}
+    return {"response": response, "order_tags": tags}
+
+
+def _start_shm_server():
+    if RUNTIME.shm_server is not None:
+        raise RuntimeError("shared-memory gateway already running")
+    region = Win32Region(SHM_NAME, SHM_SIZE, create=True)
+    try:
+        RUNTIME.shm_server = ShmRpcServer(region, _shm_dispatch)
+        RUNTIME.shm_stop = False
+        RUNTIME.direct_dispatch = True
+        _emit("info", "shared memory ready name=%s size=%s ctypes=%s; serving on QMT init thread",
+              SHM_NAME, SHM_SIZE, region.load_mode)
+        # Same lifecycle as the previous foreground Tornado loop: QMT APIs stay
+        # on init's strategy thread and requests do not depend on arriving bars.
+        while not RUNTIME.shm_stop:
+            RUNTIME.shm_server.poll()
+            time.sleep(SHM_POLL_SECONDS)
+    except Exception as exc:
+        RUNTIME.last_error = "%s: %s" % (type(exc).__name__, exc)
+        _emit("error", "shared memory stopped: %s", RUNTIME.last_error)
+        raise
+    finally:
+        if RUNTIME.shm_server is not None:
+            server, RUNTIME.shm_server = RUNTIME.shm_server, None
+            server.close()
+        else:
+            region.close()
+
+
 def init(ContextInfo):
     RUNTIME.init_called = True
     RUNTIME.context_info = ContextInfo
     _emit(
         "info",
-        "init starting account=%s account_type=%s listen=%s:%s background=%s log_file=%s",
+        "init starting account=%s account_type=%s transport=%s endpoint=%s log_file=%s",
         ACCOUNT_ID,
         ACCOUNT_TYPE,
-        LISTEN_HOST,
-        LISTEN_PORT,
-        RUN_HTTP_IN_BACKGROUND_THREAD,
+        GATEWAY_TRANSPORT,
+        SHM_NAME if GATEWAY_TRANSPORT == "shm" else "%s:%s" % (LISTEN_HOST, LISTEN_PORT),
         LOG_FILE,
     )
     _set_account_on_context(ContextInfo)
@@ -2973,16 +3376,26 @@ def init(ContextInfo):
         RUN_HTTP_IN_BACKGROUND_THREAD,
         LOG_FILE,
     )
-    _start_http_server()
+    if GATEWAY_TRANSPORT == "shm":
+        _start_shm_server()
+    else:
+        _start_http_server()
     LOGGER.info("bt_big_qmt_gateway init done: account=%s type=%s", ACCOUNT_ID, ACCOUNT_TYPE)
     _emit("info", "init done account=%s account_type=%s", ACCOUNT_ID, ACCOUNT_TYPE)
 
 
 def handlebar(ContextInfo):
+    if GATEWAY_TRANSPORT == "shm":
+        return
     RUNTIME.drain(ContextInfo)
 
 
 def stop(ContextInfo):
+    if GATEWAY_TRANSPORT == "shm":
+        # Do not close handles from a different QMT callback thread. The init
+        # loop owns the mutex and closes everything in its finally block.
+        RUNTIME.shm_stop = True
+        return
     if not STOP_HTTP_ON_QMT_STOP:
         LOGGER.info("bt_big_qmt_gateway stop ignored: STOP_HTTP_ON_QMT_STOP=false")
         _emit("warning", "stop ignored STOP_HTTP_ON_QMT_STOP=false")
@@ -3006,6 +3419,8 @@ def stop(ContextInfo):
 
 
 def _auto_start_http_on_module_load() -> None:
+    if GATEWAY_TRANSPORT != "http":
+        return
     if not AUTO_START_HTTP_ON_MODULE_LOAD:
         _emit(
             "info",

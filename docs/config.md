@@ -236,6 +236,15 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 
 这些配置作用在 `bullet-trade server` 进程。
 
+大 QMT helper 默认使用共享内存，见[迁移与诊断](big-qmt-shm.md)。`BIG_QMT_GATEWAY_TRANSPORT=shm|http` 选择通道；shm 模式忽略 gateway URL。
+
+| 共享内存变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `BIG_QMT_SHM_NAME` | `Local\BulletTrade_BigQMT_v1` | 与 helper 同名、同 Windows 登录会话。 |
+| `BIG_QMT_SHM_SIZE` | `16777216` | 映射字节数，两端一致。 |
+| `BIG_QMT_SHM_POLL_SECONDS` | `0.01` | 外部进程轮询间隔。 |
+| `BIG_QMT_SHM_JOURNAL` | `.bullet-trade/big_qmt_shm.sqlite3` | 外部订单意图及标签持久化；重启保留。 |
+
 `QMT_SERVER_TYPE=qmt` 是 MiniQMT/xtquant 后端；`QMT_SERVER_TYPE=big_qmt` 或 CLI `--server-type big_qmt` 是大 QMT helper 后端。
 
 注意：大 QMT 本身不读这里的 `.env`。大 QMT helper 的账号、端口和密码在策略文件顶部参数里配置。这里的 `BIG_QMT_GATEWAY_*` 是外部 `bullet-trade server` 进程用来连接大 QMT helper 的配置，完整步骤见 [大 QMT 服务向导](big-qmt-server.md)。

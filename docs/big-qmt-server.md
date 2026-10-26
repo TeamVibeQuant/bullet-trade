@@ -1,5 +1,7 @@
 # 大 QMT 服务向导
 
+新版默认采用 Windows 共享内存。受文件/网络 IO 限制的客户端请先看[共享内存迁移步骤](big-qmt-shm.md)。下面保留的是旧 HTTP 部署方式，仅在 helper 设置 `GATEWAY_TRANSPORT="http"`、server 设置 `BIG_QMT_GATEWAY_TRANSPORT=http` 时适用；两种模式不会自动切换。
+
 这页说明如何在大 QMT 里运行 BulletTrade helper，并启动兼容原 `qmt-remote` 的 `bullet-trade server`。
 
 适用场景：券商不再提供 MiniQMT，或者 MiniQMT 不能继续作为数据和交易网关时，用大 QMT 的策略运行环境承接行情、账户、持仓、委托、成交和下单撤单能力。

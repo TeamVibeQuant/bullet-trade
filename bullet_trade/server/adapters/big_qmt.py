@@ -13,6 +13,8 @@ from uuid import uuid4
 from bullet_trade.utils.env_loader import get_env, get_env_float
 
 from ..config import ServerConfig
+from ..big_qmt_shm import BigQmtShmTransport
+from ..shared_memory_rpc import IPC_DEFAULT_NAME, IPC_DEFAULT_SIZE, ShmError
 from . import register_adapter
 from .base import (
     AccountContext,
@@ -83,6 +85,11 @@ class BigQmtGatewayConfig:
     secret: Optional[str] = None
     timeout_seconds: float = 10.0
     action_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    transport: str = "shm"
+    shm_name: str = IPC_DEFAULT_NAME
+    shm_size: int = IPC_DEFAULT_SIZE
+    shm_poll_seconds: float = 0.01
+    shm_journal: str = ".bullet-trade/big_qmt_shm.sqlite3"
 
 
 class BigQmtGatewayError(RuntimeError):
@@ -102,7 +109,14 @@ def load_big_qmt_gateway_config(server_config: ServerConfig) -> BigQmtGatewayCon
         password=get_env("BIG_QMT_GATEWAY_PASSWORD", get_env("BIG_QMT_GATEWAY_TOKEN")),
         secret=get_env("BIG_QMT_GATEWAY_SECRET"),
         timeout_seconds=max(0.1, float(timeout or 10.0)),
+        transport=(get_env("BIG_QMT_GATEWAY_TRANSPORT", "shm") or "shm").lower(),
+        shm_name=get_env("BIG_QMT_SHM_NAME", IPC_DEFAULT_NAME) or IPC_DEFAULT_NAME,
+        shm_size=int(get_env("BIG_QMT_SHM_SIZE", str(IPC_DEFAULT_SIZE))),
+        shm_poll_seconds=get_env_float("BIG_QMT_SHM_POLL_SECONDS", 0.01),
+        shm_journal=get_env("BIG_QMT_SHM_JOURNAL", ".bullet-trade/big_qmt_shm.sqlite3"),
     )
+    if cfg.transport not in {"shm", "http"}:
+        raise ValueError("BIG_QMT_GATEWAY_TRANSPORT must be shm or http")
     cfg.action_status = _build_action_status(server_config)
     return cfg
 
@@ -115,6 +129,9 @@ class BigQmtGatewayClient:
         self._last_error: Optional[str] = None
         self._last_success_at: Optional[float] = None
         self._last_failure_at: Optional[float] = None
+        if config.transport not in {"shm", "http"}:
+            raise ValueError("gateway transport must be shm or http")
+        self._shm = BigQmtShmTransport(config) if config.transport == "shm" else None
 
     async def get(self, path: str) -> Any:
         return await self._run_blocking(self.request_json, path, None, "GET")
@@ -148,6 +165,22 @@ class BigQmtGatewayClient:
         payload: Optional[Dict[str, Any]],
         method: str,
     ) -> Any:
+        if self._shm is not None:
+            try:
+                result = self._unwrap_response(self._shm.request(path, payload, method))
+            except ShmError as exc:
+                self._record_failure(str(exc))
+                raise BigQmtGatewayError(str(exc), code=exc.code) from exc
+            except BigQmtGatewayError as exc:
+                self._record_failure(str(exc))
+                raise
+            except Exception as exc:
+                self._record_failure(str(exc))
+                raise BigQmtGatewayError(
+                    "Shared-memory gateway failed: %s" % exc, code="IPC_LOCAL_ERROR"
+                ) from exc
+            self._record_success()
+            return result
         url = self._url(path)
         body = None
         headers = {
@@ -215,7 +248,9 @@ class BigQmtGatewayClient:
             "backend_type": "big_qmt",
             "ready": ready,
             "state": state,
-            "gateway_url": self.config.base_url,
+            "gateway_transport": self.config.transport,
+            "gateway_url": self.config.base_url if self.config.transport == "http" else None,
+            "shm_name": self.config.shm_name if self.config.transport == "shm" else None,
             "trading_enabled": _health_bool(health, "trading_enabled"),
             "cancel_order_enabled": _health_bool(health, "cancel_order_enabled"),
             "last_error": self._last_error,
