@@ -7,6 +7,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from bullet_trade.broker.qmt_remote import RemoteQmtBroker
+from bullet_trade.server.adapters.big_qmt import _normalize_order
 
 
 class _FakeConn:
@@ -311,6 +312,60 @@ def test_remote_qmt_broker_keeps_timed_out_open_order(monkeypatch):
 
     assert order_id == "oid-open"
     assert broker.get_last_order_response("oid-open")["timed_out"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_raw_status, final_filled, final_status",
+    [(53, 1400, "partly_canceled"), (56, 1500, "filled")],
+)
+async def test_remote_qmt_broker_tracks_big_qmt_partial_fill_until_terminal(
+    monkeypatch, final_raw_status, final_filled, final_status
+):
+    """55 的部分成交必须保留订单号并继续查询，不能报错或重发。"""
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    row = {
+        "order_id": "5330",
+        "security": "002384.XSHE",
+        "raw_status": 55,
+        "amount": 1500,
+        "filled": 1400,
+        "volume_left": 100,
+        "price": 106.71785714285714,
+        "order_price": 108.31,
+    }
+    response = _normalize_order(row)
+    fake_conn = _FakeConn()
+
+    def request(action, payload, timeout=30.0):
+        fake_conn.requests.append((action, payload))
+        if action == "broker.orders":
+            return [dict(response)]
+        return dict(response)
+
+    fake_conn.request = request
+    broker = RemoteQmtBroker(account_id="acc")
+    broker._connection = fake_conn
+    broker.connect()
+
+    order_id = broker._place_order_sync("BUY", "002384.XSHE", 1500, 108.31, 16)
+
+    assert order_id == "5330"
+    assert broker.get_last_order_response(order_id)["status"] == "filling"
+    assert broker.get_last_order_response(order_id)["filled"] == 1400
+    assert [order["order_id"] for order in broker.get_open_orders()] == [order_id]
+
+    row.update(
+        raw_status=final_raw_status, filled=final_filled, volume_left=1500 - final_filled
+    )
+    response = _normalize_order(row)
+    final = await broker.get_order_status(order_id)
+
+    assert final["status"] == final_status
+    assert final["filled"] == final_filled
+    assert broker.get_open_orders() == []
+    assert sum(action == "broker.place_order" for action, _ in fake_conn.requests) == 1
+    broker.disconnect()
 
 
 def test_remote_qmt_broker_rejects_submit_unknown_response(monkeypatch):

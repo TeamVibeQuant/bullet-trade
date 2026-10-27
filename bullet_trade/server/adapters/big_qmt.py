@@ -59,16 +59,18 @@ _BROKER_READ_ACTIONS = (
 
 _ADMIN_ACTIONS = ("admin.health", "admin.print_account")
 
+# QMT EEntrustStatus: https://dict.thinktrader.net/innerApi/enum_constants.html
+# Use the engine's OrderStatus values so open-order queries retain partial fills.
 _ORDER_STATUS_MAP = {
     0: "unknown",
-    48: "open",
-    49: "open",
+    48: "new",
+    49: "new",
     50: "open",
-    51: "open",
-    52: "partly_filled",
-    53: "partly_filled",
-    54: "partly_canceled",
-    55: "cancelled",
+    51: "canceling",
+    52: "canceling",
+    53: "partly_canceled",
+    54: "canceled",
+    55: "filling",
     56: "filled",
     57: "rejected",
     86: "cancelled",

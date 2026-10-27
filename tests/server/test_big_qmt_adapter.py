@@ -2,6 +2,7 @@ import asyncio
 
 import pytest
 
+from bullet_trade.core.models import OrderStatus
 from bullet_trade.server.adapters import get_adapter
 from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.big_qmt import (
@@ -304,6 +305,93 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
     status = await adapter.get_order_status(ctx, "O1")
     assert status["status"] == "rejected"
     assert status["raw_status"] == 57
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_field", ["raw_status", "m_nOrderStatus"])
+@pytest.mark.parametrize(
+    "raw_status, expected_status, filled",
+    [
+        (48, OrderStatus.new, 0),
+        (49, OrderStatus.new, 0),
+        (50, OrderStatus.open, 0),
+        (51, OrderStatus.canceling, 0),
+        (52, OrderStatus.canceling, 1400),
+        (53, OrderStatus.partly_canceled, 1400),
+        (54, OrderStatus.canceled, 0),
+        (55, OrderStatus.filling, 1400),
+        (56, OrderStatus.filled, 1500),
+        (57, OrderStatus.rejected, 0),
+    ],
+)
+async def test_big_qmt_order_status_uses_engine_lifecycle_values(
+    status_field, raw_status, expected_status, filled
+):
+    row = {
+        "order_id": "5330",
+        "security": "002384.XSHE",
+        status_field: raw_status,
+        "amount": 1500,
+        "filled": filled,
+    }
+    client = _FakeGatewayClient({
+        "/place_order": row,
+        "/orders": {"orders": [row]},
+        "/order_status": {"order": row},
+    })
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    ctx = router.get("default")
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    submitted = await adapter.place_order(
+        ctx, {"security": "002384.XSHE", "amount": 1500, "side": "BUY"}
+    )
+    orders = await adapter.list_orders(ctx, {"status": expected_status})
+    queried = await adapter.get_order_status(ctx, "5330")
+
+    assert len(orders) == 1
+    for result in (submitted, orders[0], queried):
+        assert OrderStatus(result["status"]) == expected_status
+        assert result["raw_status"] == raw_status
+        assert result["amount"] == 1500
+        assert result["filled"] == filled
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_submission_confirmation_retains_partial_fill():
+    row = {
+        "order_id": "5330",
+        "security": "002384.XSHE",
+        "raw_status": 55,
+        "amount": 1500,
+        "filled": 1400,
+        "volume_left": 100,
+        "price": 106.71785714285714,
+        "order_price": 108.31,
+    }
+    snapshots = iter([{"orders": []}, {"orders": [row]}])
+    client = _FakeGatewayClient({
+        "/place_order": {"order_id": "5330"},
+        "/orders": lambda _payload: next(snapshots),
+    })
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    result = await adapter.place_order(router.get("default"), {
+        "security": "002384.XSHE",
+        "amount": 1500,
+        "side": "BUY",
+        "wait_timeout": 0.3,
+    })
+
+    assert result["order_id"] == "5330"
+    assert result["status"] == OrderStatus.filling.value
+    assert result["filled"] == 1400
+    assert result["volume_left"] == 100
+    assert result["last_snapshot"]["status"] == OrderStatus.filling.value
+    assert sum(path == "/place_order" for _, path, _ in client.calls) == 1
 
 
 @pytest.mark.asyncio
