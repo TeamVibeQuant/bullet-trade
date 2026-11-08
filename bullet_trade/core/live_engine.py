@@ -14,7 +14,9 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+import threading
+from dataclasses import asdict, dataclass
+from functools import wraps
 from datetime import datetime, timedelta, time as Time, date
 import importlib
 import hashlib
@@ -40,6 +42,7 @@ from .events import (
 )
 from .globals import g, log
 from .models import Context, Portfolio, Position, Order, Trade, OrderStyle, OrderStatus
+from .live_execution import ExecutionLedger, TERMINAL, number
 from .runtime import set_current_engine
 from .scheduler import (
     get_market_periods,
@@ -80,6 +83,7 @@ from .live_runtime import (
     save_g,
     register_portfolio,
     register_portfolio_price_refresher,
+    register_execution_state,
     load_subportfolios,
     load_scheduler_cursor,
     persist_scheduler_cursor,
@@ -191,6 +195,16 @@ class _PendingVirtualOrder:
     last_status_at: Optional[datetime] = None
     last_seen_in_broker_orders: Optional[datetime] = None
     last_open_log_at: Optional[datetime] = None
+    last_cancel_at: Optional[datetime] = None
+
+
+def _execution_locked(method):
+    """Serialize portfolio mutations with snapshot serialization and fill application."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._execution_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class LiveEngine:
@@ -282,6 +296,10 @@ class LiveEngine:
         self._active_order_submissions: int = 0
         self._suppress_cash_reconcile_until: Optional[datetime] = None
         self._suppress_position_sync_until: Optional[datetime] = None
+        self._execution = ExecutionLedger()
+        self._execution_lock = threading.RLock()
+        self._last_cash_guard_log = None
+        self._buy_blocked_at: Optional[datetime] = None
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -433,6 +451,7 @@ class LiveEngine:
         # 恢复逻辑：优先从 JSON 快照精确还原，回退按比例分配券商真实资金。
         self._restore_subportfolios()
         register_portfolio(self._portfolio)
+        register_execution_state(self._execution.export, self._execution_lock)
         register_portfolio_price_refresher(
             lambda force_log=False: self._refresh_subportfolio_snapshot_for_save(force_log=force_log)
         )
@@ -760,6 +779,12 @@ class LiveEngine:
             subportfolio_dirty = False
             for order in orders:
                 self._register_order(order)
+                if any(r["security"] == order.security and r["pindex"] == self._get_order_pindex(order)
+                       for r in self._execution.pending()):
+                    order.status = OrderStatus.canceled
+                    order.extra["error"] = "已有待确认委托，跳过重复下单"
+                    log.warning("%s", order.extra["error"] + ": " + order.security)
+                    continue
                 if broker_positions_for_order_sync is not None:
                     subportfolio_dirty = (
                         self._sync_order_position_from_broker(order, broker_positions_for_order_sync)
@@ -833,6 +858,14 @@ class LiveEngine:
                     order.price = price_value
                     self._active_order_submissions += 1
                     order_submission_active = True
+                    wait_budget = max(0.0, float(plan.wait_timeout if plan.wait_timeout is not None else 5.0))
+                    status_deadline = _monotonic() + wait_budget
+                    if len(self._portfolio_backing().subportfolios) > 1:
+                        with self._execution_lock:
+                            row = self._execution.reserve(str(order.order_id), asdict(plan),
+                                                          datetime.now().isoformat(), cash_price=price_arg)
+                            row["remark"] = remark
+                        save_g()
                     if plan.is_buy:
                         order_id = await self.broker.buy(
                             plan.security,
@@ -857,6 +890,10 @@ class LiveEngine:
                             self._broker_order_index[str(order_id)] = order.order_id
                     except Exception:
                         pass
+                    if str(order.order_id) in self._execution.orders:
+                        with self._execution_lock:
+                            self._execution.orders[str(order.order_id)]["broker_id"] = str(order_id) if order_id else None
+                        save_g()
                     try:
                         order.status = OrderStatus.open
                     except Exception:
@@ -883,10 +920,8 @@ class LiveEngine:
                         log.info('[LiveEngine] 等待获取订单状态...')
                         try:
                             interval = 0.5  # seconds
-                            order_status_timeout = 5  # seconds
                             terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "partly_canceled"}
-                            deadline = time.time() + order_status_timeout
-                            while time.time() < deadline:
+                            while True:
                                 try:
                                     status_dict = await self.broker.get_order_status(order_id)
                                     status_dict = status_dict or {}
@@ -898,7 +933,10 @@ class LiveEngine:
                                             break
                                 except Exception as e:
                                     log.debug(f"[LiveEngine] 获取订单状态失败 in-while-loop: {e}")
-                                await asyncio.sleep(interval)
+                                remaining_wait = status_deadline - _monotonic()
+                                if remaining_wait <= 0:
+                                    break
+                                await asyncio.sleep(min(interval, remaining_wait))
                         except Exception as e:
                             log.debug(f"[LiveEngine] 获取订单状态失败: {e}")
 
@@ -907,22 +945,20 @@ class LiveEngine:
                         subportfolio_dirty = True
                         self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
                         self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
-                    elif order_id:
-                        status_text = self._status_to_text(
-                            (status_dict or {}).get("status", getattr(order, "status", ""))
-                        )
-                        if status_text not in {"rejected", "canceled", "cancelled"}:
-                            self._pending_virtual_orders[str(order_id)] = _PendingVirtualOrder(
-                                order=order,
-                                plan=plan,
-                                created_at=datetime.now(),
-                                last_status=status_text,
-                                last_status_at=datetime.now() if status_text else None,
-                            )
-                    recordable_status = self._status_to_text(
+                    status_text = self._status_to_text(
                         (status_dict or {}).get("status", getattr(order, "status", ""))
                     )
-                    if risk and recordable_status not in {"rejected", "canceled", "cancelled"}:
+                    ledger_row = self._execution.orders.get(str(order.order_id))
+                    needs_tracking = (not ledger_row["terminal"] if ledger_row is not None
+                                      else order_id and status_text not in TERMINAL)
+                    if needs_tracking:
+                        pending_id = str(order_id or "unknown:" + str(order.order_id))
+                        self._pending_virtual_orders[pending_id] = _PendingVirtualOrder(
+                            order=order, plan=plan, created_at=datetime.now(),
+                            last_status=status_text if order_id else "unknown",
+                            last_status_at=datetime.now() if order_id and status_text else None,
+                        )
+                    if risk and status_text not in {"rejected", "canceled", "cancelled"}:
                         try:
                             risk.record_trade(order_value, action=action)
                         except Exception as record_exc:
@@ -945,13 +981,28 @@ class LiveEngine:
                         meta["broker_order_ids"].append(str(order_id))
                 except Exception as exc:
                     log.error(f"委托失败 {order.security}: {exc}")
+                    order.extra["error"] = str(exc)
+                    definite_reject = "status=rejected" in str(exc) or "可用资金不足" in str(exc)
+                    if "可用资金不足" in str(exc):
+                        self._record_buy_cash_rejection(str(exc))
+                    ledger_row = self._execution.orders.get(str(order.order_id))
                     try:
-                        order.status = OrderStatus.rejected
+                        order.status = OrderStatus.rejected if ledger_row is None or definite_reject else "unknown"
+                        if ledger_row is not None:
+                            with self._execution_lock:
+                                ledger_row["status"] = self._status_to_text(order.status)
+                                ledger_row["terminal"] = definite_reject
+                            if not definite_reject:
+                                pending_id = str(ledger_row.get("broker_id") or "unknown:" + str(order.order_id))
+                                self._pending_virtual_orders[pending_id] = _PendingVirtualOrder(
+                                    order=order, plan=plan, created_at=datetime.now(), last_status="unknown")
                     except Exception:
                         pass
                 finally:
                     if order_submission_active:
                         self._active_order_submissions = max(0, self._active_order_submissions - 1)
+                    if str(order.order_id) in self._execution.orders:
+                        save_g()
             order_snapshots: List[Dict[str, Any]] = []
             trade_snapshots: List[Dict[str, Any]] = []
             try:
@@ -1451,6 +1502,14 @@ class LiveEngine:
                         extra["settlement_pending_reason"] = settlement_pending_reason
                 except Exception:
                     pass
+            ledger_row = self._execution.orders.get(str(order.order_id))
+            if ledger_row is not None:
+                order.amount = ledger_row["amount"]
+                order.filled = max(order.filled, ledger_row["applied_amount"])
+                if ledger_row["terminal"]:
+                    order.status = ledger_row["status"]
+                elif self._status_to_text(order.status) in TERMINAL:
+                    order.status = "settlement_pending"
             normalized_status = self._normalize_status(getattr(order, "status", None))
             resolved_price = getattr(order, "price", None)
             resolved_filled = getattr(order, "filled", None)
@@ -1882,11 +1941,14 @@ class LiveEngine:
         sp = self._get_subportfolio(pindex)
         if sp is None:
             cash = float(getattr(self._portfolio_backing(), "available_cash", 0.0) or 0.0)
-            locked_cash = float(getattr(self._portfolio_backing(), "locked_cash", 0.0) or 0.0)
         else:
             cash = float(getattr(sp, "available_cash", 0.0) or 0.0)
-            locked_cash = float(getattr(sp, "locked_cash", 0.0) or 0.0)
-        available_cash = max(0.0, cash - locked_cash)
+        # available_cash already excludes broker freezes. Local reservations are
+        # separate and are not also written into SubPortfolio.locked_cash.
+        available_cash = max(0.0, cash)
+        if len(self._portfolio_backing().subportfolios) > 1:
+            budget = self.get_execution_budget(pindex)
+            available_cash = 0.0 if budget["blocked"] else budget["available_cash"]
         if available_cash <= 0:
             return 0
 
@@ -1901,7 +1963,8 @@ class LiveEngine:
         if cash_price <= 0:
             return amount
 
-        max_amount = int(available_cash / cash_price)
+        cash_budget = max(0.0, available_cash - max(5.0, available_cash * 0.001))
+        max_amount = int(cash_budget / cash_price)
         capped = pricing.adjust_order_amount(security, min(int(amount or 0), max_amount), True)
         if capped < amount:
             log.warning(
@@ -1914,6 +1977,63 @@ class LiveEngine:
                 capped * cash_price,
             )
         return capped
+
+    def get_execution_budget(self, pindex: int) -> Dict[str, Any]:
+        """Read-only strategy view; never refresh a broker from inside ledger reads."""
+        with self._execution_lock:
+            backing = self._portfolio_backing()
+            sp = backing.subportfolios.get(pindex)
+            pending = self._execution.pending(pindex)
+            cash = max(0.0, float(getattr(sp, "available_cash", 0.0) or 0.0)
+                       - self._execution.reserved_cash(pindex))
+            all_cash = sum(float(s.available_cash or 0) for s in backing.subportfolios.values())
+            cash = min(cash, max(0.0, all_cash - self._execution.reserved_cash()))
+            if self._execution.broker_cash is not None:
+                cash = min(cash, max(0.0, self._execution.broker_cash - self._execution.reserved_cash()))
+            if self._execution.observed_broker_cash is not None:
+                cash = min(cash, max(0.0, self._execution.observed_broker_cash))
+            rejected_this_minute = (self._buy_blocked_at is not None
+                                   and self.context.current_dt <= self._buy_blocked_at)
+            blocked = rejected_this_minute or self._execution.block_reason in {
+                "cash_nav_mismatch", "positions_before_fill", "missing_cash", "broker_cash_rejected"}
+            blocked = blocked or any(r.get("accounting_error") for r in self._execution.pending())
+            return {"available_cash": cash, "reserved_cash": self._execution.reserved_cash(pindex),
+                    "pending_value": self._execution.pending_value(pindex),
+                    "pending_buys": [r["security"] for r in pending if r["is_buy"]],
+                    "pending_sells": [r["security"] for r in pending if not r["is_buy"]],
+                    "blocked": blocked, "cash_ready": not self._execution.cash_pending
+                    and not self._execution.pending() and not blocked}
+
+    def _record_buy_cash_rejection(self, message: str) -> None:
+        self._buy_blocked_at = self.context.current_dt
+        with self._execution_lock:
+            match = re.search(r"v_enable_balance_t=([0-9.]+)", message)
+            if match:
+                self._execution.rejection_cash_limit = number(match.group(1))
+                self._execution.block_reason = "broker_cash_rejected"
+
+    def _restore_execution_state(self, state: Optional[Dict[str, Any]]) -> None:
+        if not state:
+            return
+        self._execution.restore(state)
+        for key, row in self._execution.orders.items():
+            if row["terminal"]:
+                continue
+            order = Order(order_id=key, security=row["security"], amount=row["amount"],
+                          filled=row["applied_amount"], price=row.get("price") or row["last_price"],
+                          status=row["status"], is_buy=row["is_buy"], pindex=row["pindex"],
+                          add_time=datetime.fromisoformat(row["created_at"]))
+            order.extra["order_remark"] = row.get("remark", "")
+            plan = _ResolvedOrder(**{name: row[name] for name in _ResolvedOrder.__dataclass_fields__})
+            self._register_order(order)
+            broker_id = row.get("broker_id")
+            if broker_id:
+                order._broker_order_id = broker_id
+                self._broker_order_index[str(broker_id)] = key
+            self._pending_virtual_orders[str(broker_id or "unknown:" + key)] = _PendingVirtualOrder(
+                order=order, plan=plan, created_at=order.add_time, last_status=row["status"])
+        log.info("恢复执行账本: 待确认订单=%d, 预留现金=%.2f, 待资金对账=%s",
+                 len(self._pending_virtual_orders), self._execution.reserved_cash(), self._execution.cash_pending)
 
     def _resolve_order_amount(self, order: Order, last_price: float) -> Tuple[int, bool]:
         price = last_price if last_price > 0 else 1.0
@@ -2034,6 +2154,7 @@ class LiveEngine:
             return None
         return self._broker_positions_from_snapshot(snapshot)
 
+    @_execution_locked
     def _sync_order_position_from_broker(
         self,
         order: Order,
@@ -2041,6 +2162,8 @@ class LiveEngine:
     ) -> bool:
         """Align a uniquely owned virtual position with broker quantity before sizing an order."""
         security = order.security
+        if self._execution_position_protected(security):
+            return False
         pindex = self._get_order_pindex(order)
         sp = self._get_subportfolio(pindex)
         if sp is None:
@@ -2108,6 +2231,63 @@ class LiveEngine:
         return old_total, old_closeable, changed
 
     def _apply_virtual_order_fill(
+        self, order: Order, plan: _ResolvedOrder,
+        status_snapshot: Optional[Dict[str, Any]] = None, *, log_waiting: bool = True,
+    ) -> bool:
+        if len(self._portfolio_backing().subportfolios) <= 1:
+            return self._apply_single_account_fill(order, plan, status_snapshot, log_waiting=log_waiting)
+        with self._execution_lock:
+            key = str(order.order_id)
+            sp = self._get_subportfolio(plan.pindex)
+            if sp is None:
+                raise RuntimeError("Missing subportfolio for execution: %s" % plan.pindex)
+            row = self._execution.reserve(key, asdict(plan), datetime.now().isoformat())
+            snapshot = dict(status_snapshot or {})
+            snapshot.setdefault("status", self._status_to_text(order.status))
+            cancel_info = str((snapshot.get("raw") or {}).get("m_strCancelInfo", ""))
+            if plan.is_buy and "可用资金不足" in cancel_info:
+                order.extra["error"] = cancel_info
+                self._record_buy_cash_rejection(cancel_info)
+            position = sp.positions.get(plan.security)
+            amount, value, fees = self._execution.update(
+                key, snapshot,
+                max_delta=None if plan.is_buy else int(getattr(position, "total_amount", 0) or 0),
+            )
+            order.status = row["status"]
+            order.filled = max(int(order.filled or 0), row["applied_amount"])
+            if not amount and not fees:
+                if log_waiting and not row["terminal"]:
+                    log.info("订单待确认，保留预算: %s, status=%s, filled=%d/%d, reserve=%.2f",
+                             plan.security, row["status"], row["applied_amount"], plan.amount,
+                             self._execution.order_reserve(row))
+                return False
+            if amount:
+                if position is None:
+                    if not plan.is_buy:
+                        raise RuntimeError("Missing position for confirmed sell: %s" % plan.security)
+                    position = Position(security=plan.security)
+                    sp.positions[plan.security] = position
+                position.update_position(amount if plan.is_buy else -amount, value / amount)
+                position.update_price(plan.last_price)
+                if position.total_amount <= 0:
+                    sp.positions.pop(plan.security, None)
+            cash_change = (-value if plan.is_buy else value) - fees
+            sp.available_cash = float(sp.available_cash or 0) + cash_change
+            sp.transferable_cash = min(float(sp.transferable_cash or 0), sp.available_cash)
+            if self._execution.broker_cash is not None:
+                self._execution.broker_cash = max(0.0, self._execution.broker_cash + min(0.0, cash_change))
+            backing = self._portfolio_backing()
+            self._execution.expected_positions[plan.security] = sum(
+                int(getattr(s.positions.get(plan.security), "total_amount", 0) or 0)
+                for s in backing.subportfolios.values())
+            self._execution.last_fill_at = datetime.now().isoformat()
+            backing.update_value()
+            log.info("虚拟子账户[%s]增量成交: %s %s %d股, 成交额=%.2f, 累计=%d/%d",
+                     plan.pindex, "买入" if plan.is_buy else "卖出", plan.security,
+                     amount, value, row["applied_amount"], plan.amount)
+            return True
+
+    def _apply_single_account_fill(
         self,
         order: Order,
         plan: _ResolvedOrder,
@@ -2482,6 +2662,20 @@ class LiveEngine:
                 continue
             order = pending.order
             plan = pending.plan
+            if order_id.startswith("unknown:"):
+                row = self._execution.orders.get(str(order.order_id), {})
+                matches = [snap for snap in (broker_orders or []) if row.get("remark") and
+                           (snap.get("order_remark") or snap.get("remark")) == row["remark"]]
+                if len(matches) != 1 or not matches[0].get("order_id"):
+                    continue
+                resolved_id = str(matches[0]["order_id"])
+                self._pending_virtual_orders.pop(order_id, None)
+                self._pending_virtual_orders[resolved_id] = pending
+                row["broker_id"] = resolved_id
+                self._broker_order_index[resolved_id] = order.order_id
+                order._broker_order_id = resolved_id
+                order_id = resolved_id
+                dirty = True
             broker_visible = visible_order_ids is not None and order_id in visible_order_ids
             if broker_visible:
                 pending.last_seen_in_broker_orders = now
@@ -2507,9 +2701,11 @@ class LiveEngine:
                 dirty = True
                 self._suppress_cash_reconcile_until = datetime.now() + timedelta(seconds=30)
                 self._suppress_position_sync_until = datetime.now() + timedelta(seconds=30)
+            ledger_row = self._execution.orders.get(str(order.order_id))
+            terminal = ledger_row["terminal"] if ledger_row is not None else status_text in terminal_statuses
+            if terminal:
                 self._pending_virtual_orders.pop(order_id, None)
-            elif status_text in terminal_statuses:
-                self._pending_virtual_orders.pop(order_id, None)
+                dirty = True
             elif (now - pending.created_at).total_seconds() >= timeout_s:
                 removed = await self._expire_pending_virtual_order(
                     order_id,
@@ -2616,48 +2812,27 @@ class LiveEngine:
         status_text: str,
         elapsed_s: float,
     ) -> bool:
-        cancel_ok = False
-        cancel_error: Optional[Exception] = None
+        # cancel_order acknowledges a request; only a terminal query releases funds.
+        now = datetime.now()
+        if pending.last_cancel_at and (now - pending.last_cancel_at).total_seconds() < 30:
+            return False
+        pending.last_cancel_at = now
         if self.broker:
             try:
-                cancel_ok = bool(await self.broker.cancel_order(order_id))
+                await self.broker.cancel_order(order_id)
+                snapshot = await self.broker.get_order_status(order_id) or {}
+                if self._status_to_text(snapshot.get("status")) in TERMINAL:
+                    self._apply_virtual_order_fill(pending.order, pending.plan, snapshot)
+                    row = self._execution.orders.get(str(pending.order.order_id))
+                    if row is None or row["terminal"]:
+                        pending.order.status = snapshot["status"]
+                        self._pending_virtual_orders.pop(order_id, None)
+                        return True
             except Exception as exc:
-                cancel_error = exc
-
-        if broker_visible and not cancel_ok:
-            if cancel_error is not None:
-                log.warning(
-                    "待确认订单超时但撤单失败，继续保留: order_id=%s, stock=%s, status=%s, elapsed=%.1fs, err=%s",
-                    order_id,
-                    pending.plan.security,
-                    status_text or "unknown",
-                    elapsed_s,
-                    cancel_error,
-                )
-            else:
-                log.warning(
-                    "待确认订单超时但券商仍可见且撤单未成功，继续保留: order_id=%s, stock=%s, status=%s, elapsed=%.1fs",
-                    order_id,
-                    pending.plan.security,
-                    status_text or "unknown",
-                    elapsed_s,
-                )
-            return False
-
-        pending.order.status = "canceled"
-        self._pending_virtual_orders.pop(order_id, None)
-        reason = "券商订单列表不可见" if not broker_visible else "撤单成功"
-        if not has_status_snapshot:
-            reason += ", 状态快照为空"
-        log.warning(
-            "待确认订单超时，已移除本地pending且不更新虚拟持仓: order_id=%s, stock=%s, status=%s, elapsed=%.1fs, reason=%s",
-            order_id,
-            pending.plan.security,
-            status_text or "unknown",
-            elapsed_s,
-            reason,
-        )
-        return True
+                log.warning("超时订单撤单/查单尚未确认: order_id=%s, err=%s", order_id, exc)
+        log.warning("订单超时但未确认终态，继续保留预算: order_id=%s, stock=%s, status=%s, elapsed=%.1fs",
+                    order_id, pending.plan.security, status_text or "unknown", elapsed_s)
+        return False
 
     async def _risk_step(self) -> None:
         if not self._risk:
@@ -2825,6 +3000,7 @@ class LiveEngine:
                     idx, len(sp.positions), sp.available_cash, sp.total_value,
                 )
 
+            self._restore_execution_state(snapshot.get("execution_state"))
             broker_snapshot = None
             try:
                 broker_snapshot = self.broker.sync_account() if self.broker and self.broker.supports_account_sync() else None
@@ -2836,6 +3012,7 @@ class LiveEngine:
             self._reconcile_subportfolio_cash(
                 backing,
                 self._to_float((broker_snapshot or {}).get("available_cash"), default=None) if broker_snapshot else None,
+                snapshot=broker_snapshot,
             )
             backing.update_value()
             self._subportfolios_restored = True
@@ -2944,12 +3121,13 @@ class LiveEngine:
             ),
         )
 
+    @_execution_locked
     def _recover_missing_subportfolio_positions(
         self,
         backing: Portfolio,
         snapshot: Optional[Dict[str, Any]],
     ) -> bool:
-        if self._virtual_position_amount(backing) > 0:
+        if self._execution.pending() or self._execution.cash_pending or self._virtual_position_amount(backing) > 0:
             return False
 
         idx = self._select_subportfolio_for_position_recovery(backing)
@@ -3009,6 +3187,7 @@ class LiveEngine:
                 return idx
         return None
 
+    @_execution_locked
     def _sync_subportfolio_positions_from_broker_snapshot(
         self,
         backing: Portfolio,
@@ -3033,6 +3212,8 @@ class LiveEngine:
 
         changed = False
         for security, broker_pos in broker_positions.items():
+            if self._execution_position_protected(security):
+                continue
             owners = self._position_owner_indices(backing, security)
             if len(owners) == 1:
                 sp = subs.get(owners[0])
@@ -3070,6 +3251,8 @@ class LiveEngine:
         for sp in subs.values():
             virtual_securities.update((getattr(sp, "positions", {}) or {}).keys())
         for security in sorted(virtual_securities - set(broker_positions.keys())):
+            if self._execution_position_protected(security):
+                continue
             if self._is_snapshot_excluded_for_any_subportfolio(backing, security):
                 continue
             owners = self._position_owner_indices(backing, security)
@@ -3088,6 +3271,11 @@ class LiveEngine:
             backing.update_value()
         return changed
 
+    def _execution_position_protected(self, security: str) -> bool:
+        return security in self._execution.expected_positions or any(
+            row["security"] == security for row in self._execution.pending())
+
+    @_execution_locked
     def _refresh_subportfolio_prices(
         self,
         backing: Portfolio,
@@ -3190,6 +3378,7 @@ class LiveEngine:
         cash_reconciled = self._reconcile_subportfolio_cash(
             backing,
             self._to_float((snapshot or {}).get("available_cash"), default=None) if snapshot else None,
+            snapshot=snapshot,
         )
         if recovered or synced_positions or refreshed or cash_reconciled:
             backing.update_value()
@@ -3877,7 +4066,11 @@ class LiveEngine:
             return {}
         return {idx: value / total_ratio for idx, value in ratios.items()}
 
-    def _reconcile_subportfolio_cash(self, target: Portfolio, real_cash: Optional[float]) -> bool:
+    @_execution_locked
+    def _reconcile_subportfolio_cash(self, target: Portfolio, real_cash: Optional[float],
+                                    snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        if real_cash is not None:
+            self._execution.observed_broker_cash = number(real_cash)
         if real_cash is None:
             return False
         if self._suppress_cash_reconcile_until and datetime.now() < self._suppress_cash_reconcile_until:
@@ -3894,6 +4087,25 @@ class LiveEngine:
             return False
 
         virtual_cash = sum(float(getattr(sp, "available_cash", 0.0) or 0.0) for sp in subs.values())
+        if snapshot is not None:
+            # Do not turn pre-fill cash into a fictitious external deposit.
+            if not self._execution.check_cash(snapshot, virtual_cash):
+                signature = (self._execution.block_reason, round(float(real_cash), 2), round(virtual_cash, 2))
+                if signature != self._last_cash_guard_log:
+                    self._last_cash_guard_log = signature
+                    log.warning("资金快照待核对，保留本地账本: reason=%s, broker_cash=%.2f, virtual_cash=%.2f, "
+                                "delta=%.2f, pending=%d, last_fill=%s, broker_total=%s",
+                                self._execution.block_reason, real_cash, virtual_cash,
+                                float(real_cash) - virtual_cash, len(self._execution.pending()),
+                                self._execution.last_fill_at, snapshot.get("total_value"))
+                return False
+            self._last_cash_guard_log = None
+            frozen = number(snapshot.get("locked_cash", snapshot.get("frozen_cash")))
+            # External/manual open orders are a physical buying-power cap, not a
+            # withdrawal from the virtual ledger. Their frozen balance still exists.
+            real_cash = float(real_cash) + frozen
+        elif self._execution.cash_pending or self._execution.pending():
+            return False
         cash_delta = float(real_cash) - virtual_cash
         threshold = float(get_settings().options.get("subportfolio_external_cash_sync_threshold", 1.0) or 0.0)
         if abs(cash_delta) < threshold:
@@ -3959,6 +4171,8 @@ class LiveEngine:
         try:
             target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
             cash = snapshot.get('available_cash')
+            if cash is not None:
+                self._execution.observed_broker_cash = number(cash)
             transferable = snapshot.get('transferable_cash')
             locked = snapshot.get('locked_cash')
             if locked is None:
@@ -4052,6 +4266,7 @@ class LiveEngine:
                     cash_reconciled = self._reconcile_subportfolio_cash(
                         target,
                         float(cash) if cash is not None else None,
+                        snapshot=snapshot,
                     )
 
             target.update_value()

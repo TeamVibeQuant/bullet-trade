@@ -56,13 +56,16 @@ from bullet_trade.data.providers.base import DataProvider
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
-_V2_SPEC = importlib.util.spec_from_file_location("bt_v2_bridge_live_engine_test", V2_BRIDGE_PATH)
-assert _V2_SPEC is not None and _V2_SPEC.loader is not None
-_V2_MODULE = importlib.util.module_from_spec(_V2_SPEC)
-sys.modules[_V2_SPEC.name] = _V2_MODULE
-_V2_SPEC.loader.exec_module(_V2_MODULE)
-AiStocksV2Broker = _V2_MODULE.AiStocksV2Broker
-V2ClientConfig = _V2_MODULE.V2ClientConfig
+if V2_BRIDGE_PATH.exists():
+    _V2_SPEC = importlib.util.spec_from_file_location("bt_v2_bridge_live_engine_test", V2_BRIDGE_PATH)
+    assert _V2_SPEC is not None and _V2_SPEC.loader is not None
+    _V2_MODULE = importlib.util.module_from_spec(_V2_SPEC)
+    sys.modules[_V2_SPEC.name] = _V2_MODULE
+    _V2_SPEC.loader.exec_module(_V2_MODULE)
+    AiStocksV2Broker = _V2_MODULE.AiStocksV2Broker
+    V2ClientConfig = _V2_MODULE.V2ClientConfig
+else:
+    AiStocksV2Broker = V2ClientConfig = None
 
 
 class OfflineLiveProvider(DataProvider):
@@ -618,6 +621,8 @@ class SequencedV2Client:
 
 
 def _build_v2_broker(client: SequencedV2Client) -> Any:
+    if AiStocksV2Broker is None:
+        pytest.skip("Optional external V2 bridge is not included in this checkout")
     broker = AiStocksV2Broker(
         V2ClientConfig(
             host="127.0.0.1",
@@ -3311,7 +3316,7 @@ async def test_order_waits_until_processed(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pending_missing_broker_order_expires_without_virtual_fill(tmp_path):
+async def test_pending_missing_broker_order_keeps_waiting_without_terminal_confirmation(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {
         "runtime_dir": str(tmp_path / "runtime"),
@@ -3381,8 +3386,8 @@ async def test_pending_missing_broker_order_expires_without_virtual_fill(tmp_pat
 
     await engine._order_sync_step()
 
-    assert engine._pending_virtual_orders == {}
-    assert order.status == "canceled"
+    assert "broker-ghost-1" in engine._pending_virtual_orders
+    assert order.status != "canceled"
     assert broker.cancelled == ["broker-ghost-1"]
 
 

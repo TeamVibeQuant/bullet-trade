@@ -15,6 +15,7 @@ import os
 import pickle
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional, Sequence, Set, Tuple
 
@@ -36,6 +37,15 @@ _save_success_log_lock = threading.Lock()
 # 子账户持久化：由 LiveEngine 注册 portfolio 引用，save_g 时自动保存
 _portfolio_ref: Any = None
 _portfolio_price_refresher: Optional[Callable[..., bool]] = None
+_execution_state_exporter: Optional[Callable] = None
+_execution_state_lock: Any = None
+
+
+def register_execution_state(exporter: Callable, lock: Any) -> None:
+    """Save cash, positions and their applied-fill watermark in one atomic file."""
+    global _execution_state_exporter, _execution_state_lock
+    _execution_state_exporter = exporter
+    _execution_state_lock = lock
 
 
 def _log_save_success(log_key: str, message: str) -> None:
@@ -102,6 +112,7 @@ def init_live_runtime(runtime_dir: str) -> None:
     初始化 live 运行态：创建目录并尝试加载 g，同时准备扩展状态。
     """
     global _runtime_dir, _restored_from_disk, _portfolio_ref, _portfolio_price_refresher
+    global _execution_state_exporter, _execution_state_lock
     stop_g_autosave()
     _runtime_dir = os.path.abspath(os.path.expanduser(runtime_dir))
     os.makedirs(_runtime_dir, exist_ok=True)
@@ -111,6 +122,8 @@ def init_live_runtime(runtime_dir: str) -> None:
     _restored_from_disk = False
     _portfolio_ref = None
     _portfolio_price_refresher = None
+    _execution_state_exporter = None
+    _execution_state_lock = None
     with _save_success_log_lock:
         _save_success_log_times.clear()
     # 加载 g
@@ -192,6 +205,7 @@ def stop_g_autosave() -> None:
 def close_live_runtime(*, save: bool = True) -> None:
     """在券商断开前完成最终保存，随后禁止迟到的回调继续访问该运行态。"""
     global _runtime_dir, _portfolio_ref, _portfolio_price_refresher
+    global _execution_state_exporter, _execution_state_lock
     stop_g_autosave()
     with _save_lock:
         try:
@@ -200,6 +214,8 @@ def close_live_runtime(*, save: bool = True) -> None:
         finally:
             _portfolio_price_refresher = None
             _portfolio_ref = None
+            _execution_state_exporter = None
+            _execution_state_lock = None
             _runtime_dir = None
 
 
@@ -295,6 +311,11 @@ def _is_snapshot_excluded_position(security: str, excluded: Set[str]) -> bool:
 
 
 def save_subportfolios() -> None:
+    with _execution_state_lock or nullcontext():
+        _save_subportfolios()
+
+
+def _save_subportfolios() -> None:
     """将所有子账户的 positions + cash 序列化为 JSON。"""
     if _runtime_dir is None or _portfolio_ref is None:
         return
@@ -323,6 +344,8 @@ def save_subportfolios() -> None:
                 log.debug(f'🛟 保存子账户快照前刷新价格失败: {exc}')
 
         data: Dict[str, Any] = {'subportfolios': {}, 'saved_at': datetime.now().isoformat()}
+        if _execution_state_exporter is not None:
+            data['execution_state'] = _execution_state_exporter()
         for idx, sp in subs.items():
             excluded_positions = _snapshot_excluded_positions(idx)
             positions_data: Dict[str, Any] = {}

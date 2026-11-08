@@ -110,6 +110,67 @@ async def bootstrap(engine):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("heartbeat_enabled,risk_enabled", [(True, False), (False, True), (True, True)])
+async def test_start_runs_enabled_heartbeat_and_risk_jobs(lifecycle, monkeypatch, heartbeat_enabled, risk_enabled):
+    engine, broker, _, _ = lifecycle
+    engine.config.broker_heartbeat_interval = 30 if heartbeat_enabled else 0
+    engine.config.risk_check_enabled = risk_enabled
+    engine.config.risk_check_interval = 30
+    # Exercise the real registration and periodic task loop, with an offline broker.
+    monkeypatch.setattr(engine, "_start_background_jobs", LiveEngine._start_background_jobs.__get__(engine))
+    heartbeat_seen, risk_seen = asyncio.Event(), asyncio.Event()
+
+    def heartbeat():
+        engine._loop.call_soon_threadsafe(heartbeat_seen.set)
+
+    def risk_summary():
+        risk_seen.set()
+        return "offline risk status"
+
+    monkeypatch.setattr(broker, "heartbeat", heartbeat)
+    engine._risk = SimpleNamespace(get_status_summary=risk_summary)
+
+    async def run_loop():
+        waits = [event.wait() for event, enabled in
+                 ((heartbeat_seen, heartbeat_enabled), (risk_seen, risk_enabled)) if enabled]
+        await asyncio.wait_for(asyncio.gather(*waits), timeout=3)
+
+    monkeypatch.setattr(engine, "_run_loop", run_loop)
+    await engine.start()
+    assert heartbeat_seen.is_set() is heartbeat_enabled
+    assert risk_seen.is_set() is risk_enabled
+    assert not engine._background_tasks
+    assert engine._runtime_lock is None
+    assert broker.events[-1] == "disconnect"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["disconnected", "heartbeat_error"])
+async def test_heartbeat_requests_reconnect_on_connection_failure(lifecycle, monkeypatch, failure):
+    engine, broker, _, _ = lifecycle
+    await bootstrap(engine)
+    reconnect_reasons, heartbeat_calls = [], []
+
+    async def reconnect(reason):
+        reconnect_reasons.append(reason)
+
+    def heartbeat():
+        heartbeat_calls.append(True)
+        raise RuntimeError("offline heartbeat error")
+
+    monkeypatch.setattr(engine, "_reconnect_broker", reconnect)
+    monkeypatch.setattr(broker, "heartbeat", heartbeat)
+    broker._connected = failure != "disconnected"
+    try:
+        await engine._heartbeat_step()
+        expected = "broker disconnected" if failure == "disconnected" else "heartbeat failed: offline heartbeat error"
+        assert reconnect_reasons == [expected]
+        assert len(heartbeat_calls) == (failure == "heartbeat_error")
+    finally:
+        await engine._shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("restored", [False, True])
 async def test_initializers_use_broker_nav_without_querying_partial_subportfolios(
     lifecycle, monkeypatch, restored,
